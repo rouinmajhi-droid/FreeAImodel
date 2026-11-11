@@ -1,0 +1,133 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Stores user account details, role, and free credits balance",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128 },
+        "email": { "type": "string", "maxLength": 256 },
+        "displayName": { "type": "string", "maxLength": 128 },
+        "photoURL": { "type": "string", "maxLength": 512 },
+        "role": { "type": "string", "enum": ["user", "admin"] },
+        "freeCreditsAllocated": { "type": "number" },
+        "freeCreditsSpent": { "type": "number" },
+        "totalRequests": { "type": "number" },
+        "totalTokens": { "type": "number" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["uid", "email", "role", "freeCreditsAllocated", "freeCreditsSpent"]
+    },
+    "ApiKey": {
+      "title": "ApiKey",
+      "description": "User-generated sk-gateway API keys for accessing OpenAI-compatible gateway endpoints",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "userId": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 128 },
+        "key": { "type": "string", "maxLength": 128 },
+        "keyPrefix": { "type": "string", "maxLength": 32 },
+        "status": { "type": "string", "enum": ["active", "revoked"] },
+        "totalRequests": { "type": "number" },
+        "totalTokens": { "type": "number" },
+        "createdAt": { "type": "string" },
+        "lastUsedAt": { "type": "string" }
+      },
+      "required": ["id", "userId", "name", "key", "status"]
+    },
+    "ProviderKey": {
+      "title": "ProviderKey",
+      "description": "Upstream AI provider API key in the Master Key Pool for rotation and failover",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "provider": { "type": "string", "maxLength": 64 },
+        "key": { "type": "string", "maxLength": 512 },
+        "keyHint": { "type": "string", "maxLength": 32 },
+        "status": { "type": "string", "enum": ["active", "rate_limited", "exhausted", "disabled"] },
+        "requestCount": { "type": "number" },
+        "errorCount": { "type": "number" },
+        "lastError": { "type": "string", "maxLength": 512 },
+        "cooldownUntil": { "type": "number" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "provider", "key", "status"]
+    },
+    "GatewayModel": {
+      "title": "GatewayModel",
+      "description": "Discovered AI models from upstream providers available on the gateway",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 128 },
+        "provider": { "type": "string", "maxLength": 64 },
+        "contextWindow": { "type": "number" },
+        "pricingPrompt": { "type": "number" },
+        "pricingCompletion": { "type": "number" },
+        "activeKeysCount": { "type": "number" },
+        "discoveredAt": { "type": "string" }
+      },
+      "required": ["id", "name", "provider"]
+    },
+    "RequestLog": {
+      "title": "RequestLog",
+      "description": "Execution log for metrics, token consumption, and analytics",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "userId": { "type": "string", "maxLength": 128 },
+        "apiKeyId": { "type": "string", "maxLength": 128 },
+        "model": { "type": "string", "maxLength": 128 },
+        "provider": { "type": "string", "maxLength": 64 },
+        "promptTokens": { "type": "number" },
+        "completionTokens": { "type": "number" },
+        "totalTokens": { "type": "number" },
+        "costUsd": { "type": "number" },
+        "latencyMs": { "type": "number" },
+        "status": { "type": "number" },
+        "timestamp": { "type": "string" }
+      },
+      "required": ["id", "userId", "model", "timestamp"]
+    },
+    "AdminConfig": {
+      "title": "AdminConfig",
+      "description": "Designated administrator identity record",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128 },
+        "email": { "type": "string", "maxLength": 256 },
+        "addedAt": { "type": "string" }
+      },
+      "required": ["uid", "email"]
+    }
+  },
+  "firestore": {
+    "/user_profiles/{userId}": {
+      "schema": "UserProfile",
+      "description": "User profile document indexed by Firebase Auth UID"
+    },
+    "/api_keys/{apiKeyId}": {
+      "schema": "ApiKey",
+      "description": "Gateway API keys owned by users"
+    },
+    "/provider_keys/{providerKeyId}": {
+      "schema": "ProviderKey",
+      "description": "Master key pool managed by administrators for load balancing and rotation"
+    },
+    "/models/{modelId}": {
+      "schema": "GatewayModel",
+      "description": "Dynamically discovered model list available for routing"
+    },
+    "/request_logs/{logId}": {
+      "schema": "RequestLog",
+      "description": "API request analytics and telemetry logs"
+    },
+    "/admins/{adminUid}": {
+      "schema": "AdminConfig",
+      "description": "Privileged administrator records"
+    }
+  }
+}

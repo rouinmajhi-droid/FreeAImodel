@@ -1,0 +1,6 @@
+{
+  "name": "NexusGate - Universal AI API Gateway & Management Dashboard",
+  "description": "Modern full-stack OpenAI-compatible API Gateway with multi-provider failover, dynamic model discovery, key rotation, and $50B free credits management.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
