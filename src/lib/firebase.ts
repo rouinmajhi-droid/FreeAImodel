@@ -7,7 +7,7 @@ import {
   DocumentReference,
   CollectionReference
 } from 'firebase/firestore';
-import { getAuth, GoogleAuthProvider } from 'firebase/auth';
+import { getAuth, GoogleAuthProvider, GithubAuthProvider, OAuthProvider } from 'firebase/auth';
 import firebaseConfig from '../../firebase-applet-config.json';
 
 export const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
@@ -17,6 +17,10 @@ export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: 'select_account' });
+
+export const githubProvider = new GithubAuthProvider();
+export const microsoftProvider = new OAuthProvider('microsoft.com');
+microsoftProvider.setCustomParameters({ prompt: 'select_account' });
 
 export const DESIGNATED_ADMIN_EMAIL = 'rouinmajhi@gmail.com';
 

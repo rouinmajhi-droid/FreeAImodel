@@ -37,6 +37,7 @@ function GatewayApp() {
 
   // Layout & Navigation Tab
   const [activeTab, setActiveTab] = useState<NavTab>('dashboard');
+  const [isLoginRoute, setIsLoginRoute] = useState<boolean>(false);
 
   // Gateway Keys & State
   const [apiKeys, setApiKeys] = useState<ApiKey[]>([]);
@@ -53,14 +54,25 @@ function GatewayApp() {
   // Sync with URL routing
   useEffect(() => {
     const checkPath = () => {
-      const path = window.location.pathname;
-      const hash = window.location.hash;
+      const path = window.location.pathname.toLowerCase();
+      const hash = window.location.hash.toLowerCase();
+      
+      if (path === '/login' || hash === '#login') {
+        setIsLoginRoute(true);
+      } else {
+        setIsLoginRoute(false);
+      }
+
       if (path === '/admin' || hash === '#admin') setActiveTab('admin');
       else if (path.includes('/keys') || hash === '#keys') setActiveTab('keys');
       else if (path.includes('/playground') || hash === '#playground') setActiveTab('playground');
       else if (path.includes('/models') || hash === '#models') setActiveTab('models');
       else if (path.includes('/settings') || hash === '#settings') setActiveTab('settings');
-      else setActiveTab('dashboard');
+      else if (path === '/login' || hash === '#login') {
+        // preserve current tab or default to dashboard
+      } else {
+        setActiveTab('dashboard');
+      }
     };
 
     checkPath();
@@ -422,42 +434,75 @@ function GatewayApp() {
 
   const isAuthenticated = Boolean(currentUser || devUser);
 
+  // If user navigated to /login or clicked "Get Free API Key" or clicked "Sign In"
+  if (!isAuthenticated && (isLoginRoute || showAuthModal)) {
+    return (
+      <LoginModal
+        isFullPage={true}
+        onBack={() => {
+          setShowAuthModal(false);
+          setIsLoginRoute(false);
+          window.history.pushState(null, '', '/');
+        }}
+        onSuccess={() => {
+          setShowAuthModal(false);
+          setIsLoginRoute(false);
+          // If they were trying to access /admin, keep it
+          if (window.location.pathname.toLowerCase() === '/admin' || window.location.hash.toLowerCase() === '#admin') {
+            setActiveTab('admin');
+          }
+        }}
+      />
+    );
+  }
+
+  // If unauthenticated and visited /admin directly, show Admin authentication page
+  if (!isAuthenticated && activeTab === 'admin') {
+    return (
+      <div className="min-h-screen bg-[#FAF9F6] flex flex-col justify-center items-center p-4">
+        <div className="w-full max-w-md">
+          <div className="mb-4 text-center">
+            <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-violet-100 text-violet-800 text-xs font-semibold">
+              🔒 Admin Access Portal
+            </span>
+          </div>
+          <LoginModal
+            isFullPage={false}
+            onBack={() => {
+              setActiveTab('dashboard');
+              window.history.pushState(null, '', '/');
+            }}
+            onSuccess={() => {
+              setActiveTab('admin');
+            }}
+          />
+        </div>
+      </div>
+    );
+  }
+
   if (!isAuthenticated) {
     return (
-      <>
-        <LandingPage
-          models={models}
-          onGetFreeApiKey={() => setShowAuthModal(true)}
-          onOpenPlayground={() => {
-            setShowAuthModal(true);
-          }}
-          onViewModels={() => {
-            const section = document.getElementById('models-showcase');
-            if (section) {
-              section.scrollIntoView({ behavior: 'smooth' });
-            } else {
-              setShowAuthModal(true);
-            }
-          }}
-        />
-
-        {showAuthModal && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-zinc-950/60 backdrop-blur-xs animate-in fade-in">
-            <div className="relative w-full max-w-md">
-              <button
-                onClick={() => setShowAuthModal(false)}
-                className="absolute top-4 right-4 z-10 text-zinc-400 hover:text-zinc-600 bg-zinc-100 hover:bg-zinc-200 rounded-full w-8 h-8 flex items-center justify-center cursor-pointer transition-colors"
-                title="Close"
-              >
-                ✕
-              </button>
-              <LoginModal 
-                onSuccess={() => setShowAuthModal(false)} 
-              />
-            </div>
-          </div>
-        )}
-      </>
+      <LandingPage
+        models={models}
+        onGetFreeApiKey={() => {
+          setIsLoginRoute(true);
+          window.history.pushState(null, '', '/login');
+        }}
+        onOpenPlayground={() => {
+          setIsLoginRoute(true);
+          window.history.pushState(null, '', '/login');
+        }}
+        onViewModels={() => {
+          const section = document.getElementById('models');
+          if (section) {
+            section.scrollIntoView({ behavior: 'smooth' });
+          } else {
+            setIsLoginRoute(true);
+            window.history.pushState(null, '', '/login');
+          }
+        }}
+      />
     );
   }
 
