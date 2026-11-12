@@ -42,9 +42,10 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
   const { showToast } = useToast();
   const [copiedUrl, setCopiedUrl] = React.useState<string | null>(null);
 
-  const [useLiveUrl, setUseLiveUrl] = React.useState(false);
-  const liveOrigin = typeof window !== 'undefined' ? window.location.origin : 'https://yourdomain.com';
-  const customDomain = 'https://yourdomain.com';
+  // Default to live running server origin so developers can test directly
+  const [useLiveUrl, setUseLiveUrl] = React.useState(true);
+  const liveOrigin = typeof window !== 'undefined' ? window.location.origin : 'https://freeaimodel.org';
+  const customDomain = 'https://freeaimodel.org';
   const baseUrl = useLiveUrl ? liveOrigin : customDomain;
 
   const chatUrl = `${baseUrl}/v1/chat/completions`;
@@ -227,11 +228,11 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
               {models.slice(0, 4).map((m) => (
                 <div key={m.id} className="flex items-center justify-between text-xs py-1.5 px-2 rounded-md hover:bg-zinc-50">
                   <div className="flex items-center gap-2 min-w-0">
-                    <ProviderLogo provider={m.provider} size={14} />
+                    <ProviderLogo provider={m.provider} size={15} />
                     <span className="font-medium text-zinc-800 truncate">{m.name || m.id}</span>
                   </div>
-                  <span className="text-[10px] uppercase font-semibold text-zinc-400 bg-zinc-100 px-1.5 py-0.5 rounded">
-                    {m.provider}
+                  <span className="text-[10px] font-bold text-emerald-600 bg-emerald-50 border border-emerald-200/80 px-1.5 py-0.2 rounded-full">
+                    FREE
                   </span>
                 </div>
               ))}

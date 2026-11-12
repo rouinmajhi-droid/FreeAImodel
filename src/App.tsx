@@ -23,6 +23,7 @@ import { ModelsView } from './components/ModelsView';
 import { AdminPanel } from './components/AdminPanel';
 import { SettingsView } from './components/SettingsView';
 import { LoginModal } from './components/LoginModal';
+import { LandingPage } from './components/LandingPage';
 
 function GatewayApp() {
   const { showToast } = useToast();
@@ -32,6 +33,7 @@ function GatewayApp() {
   const [devUser, setDevUser] = useState<{ email: string; displayName: string; uid: string } | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
+  const [showAuthModal, setShowAuthModal] = useState(false);
 
   // Layout & Navigation Tab
   const [activeTab, setActiveTab] = useState<NavTab>('dashboard');
@@ -219,21 +221,10 @@ function GatewayApp() {
 
       setProviderKeys(initialPool);
 
-      // Seed default user key
-      const defaultUserKey: ApiKey = {
-        id: 'key_' + Math.random().toString(36).substring(2, 9),
-        userId: activeUid,
-        name: 'Default Development Key',
-        key: 'sk-gateway-live-' + Math.random().toString(36).substring(2, 12) + Math.random().toString(36).substring(2, 12),
-        keyPrefix: 'sk-gateway-...live',
-        status: 'active',
-        totalRequests: 0,
-        totalTokens: 0,
-        createdAt: new Date().toISOString()
-      };
-      setApiKeys([defaultUserKey]);
+      // Start with clean 0 keys so endpoint remains hidden until user creates their first key
+      setApiKeys([]);
 
-      syncWithBackend([defaultUserKey], initialPool);
+      syncWithBackend([], initialPool);
     };
 
     initializeData();
@@ -432,7 +423,42 @@ function GatewayApp() {
   const isAuthenticated = Boolean(currentUser || devUser);
 
   if (!isAuthenticated) {
-    return <LoginModal onDevQuickLogin={handleDevQuickLogin} />;
+    return (
+      <>
+        <LandingPage
+          models={models}
+          onGetFreeApiKey={() => setShowAuthModal(true)}
+          onOpenPlayground={() => {
+            setShowAuthModal(true);
+          }}
+          onViewModels={() => {
+            const section = document.getElementById('models-showcase');
+            if (section) {
+              section.scrollIntoView({ behavior: 'smooth' });
+            } else {
+              setShowAuthModal(true);
+            }
+          }}
+        />
+
+        {showAuthModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-zinc-950/60 backdrop-blur-xs animate-in fade-in">
+            <div className="relative w-full max-w-md">
+              <button
+                onClick={() => setShowAuthModal(false)}
+                className="absolute top-4 right-4 z-10 text-zinc-400 hover:text-zinc-600 bg-zinc-100 hover:bg-zinc-200 rounded-full w-8 h-8 flex items-center justify-center cursor-pointer transition-colors"
+                title="Close"
+              >
+                ✕
+              </button>
+              <LoginModal 
+                onSuccess={() => setShowAuthModal(false)} 
+              />
+            </div>
+          </div>
+        )}
+      </>
+    );
   }
 
   return (

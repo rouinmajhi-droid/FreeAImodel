@@ -1,20 +1,16 @@
 import React, { useState } from 'react';
 import { 
-  Layers, 
   Search, 
   Sparkles, 
   Terminal, 
-  ShieldCheck, 
   Plus, 
   RefreshCw, 
-  Key, 
   Check, 
   Copy, 
   X, 
-  Cpu, 
-  ExternalLink,
-  Trash2,
-  AlertCircle
+  AlertCircle,
+  Key,
+  Layers
 } from 'lucide-react';
 import { GatewayModel, ProviderKey } from '../types/gateway';
 import { ProviderLogo } from './ProviderLogo';
@@ -67,17 +63,17 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
     try {
       const res = await onAddKeyAndFetchModels(inputKeys, selectedProvider);
       setAddResult({
-        message: `Success! Added ${res.addedCount} key(s) and discovered ${res.modelsCount} model(s) automatically.`,
+        message: `Success! Added ${res.addedCount} key(s) and discovered ${res.modelsCount} model(s).`,
         isError: false
       });
       setInputKeys('');
       setTimeout(() => {
         setIsAddModalOpen(false);
         setAddResult(null);
-      }, 1800);
+      }, 1500);
     } catch (err: any) {
       setAddResult({
-        message: err.message || 'Failed to auto-discover models from provided key(s). Please verify key validity.',
+        message: err.message || 'Failed to auto-discover models from provided key(s).',
         isError: true
       });
     } finally {
@@ -117,48 +113,19 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
     return true;
   });
 
-  // Calculate provider branding color
-  const getProviderBadgeStyle = (provider: string) => {
-    switch (provider.toLowerCase()) {
-      case 'groq':
-        return 'bg-amber-50 text-amber-800 border-amber-200';
-      case 'openai':
-        return 'bg-emerald-50 text-emerald-800 border-emerald-200';
-      case 'gemini':
-        return 'bg-violet-50 text-violet-800 border-violet-200';
-      case 'openrouter':
-        return 'bg-purple-50 text-purple-800 border-purple-200';
-      case 'deepseek':
-        return 'bg-sky-50 text-sky-800 border-sky-200';
-      case 'mistral':
-        return 'bg-orange-50 text-orange-800 border-orange-200';
-      case 'cerebras':
-        return 'bg-rose-50 text-rose-800 border-rose-200';
-      default:
-        return 'bg-zinc-100 text-zinc-700 border-zinc-200';
-    }
-  };
-
-  // Find which keys provide a given model
-  const getKeysForModel = (modelId: string) => {
-    return providerKeys.filter(pk => 
-      pk.supportedModels && pk.supportedModels.includes(modelId)
-    );
-  };
-
   return (
     <div className="space-y-6 animate-in fade-in duration-200">
       {/* 1. Header & Actions */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
-          <div className="flex items-center gap-2">
-            <h1 className="text-2xl font-semibold text-zinc-900 tracking-tight">Models & Dynamic Discovery</h1>
-            <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-violet-100 text-violet-700">
-              Live Gateway
+          <div className="flex items-center gap-2.5">
+            <h1 className="text-2xl font-bold text-zinc-900 tracking-tight">Models</h1>
+            <span className="text-xs font-semibold px-2.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200/80">
+              {models.length} Free Models Available
             </span>
           </div>
-          <p className="text-sm text-zinc-600 mt-1 max-w-2xl">
-            Automatically discover, catalog, and route to all available models from every API key you connect. Requests fail over across keys seamlessly.
+          <p className="text-sm text-zinc-500 mt-1">
+            Browse and query AI models with free access via OpenAI-compatible endpoints.
           </p>
         </div>
 
@@ -167,7 +134,7 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
             onClick={handleRefresh}
             disabled={isRefreshing}
             className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-zinc-700 bg-white border border-zinc-200 rounded-lg hover:bg-zinc-50 transition-colors shadow-xs disabled:opacity-50 cursor-pointer"
-            title="Re-query /v1/models across all connected keys"
+            title="Sync /v1/models across active provider keys"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin text-violet-600' : 'text-zinc-500'}`} />
             <span>{isRefreshing ? 'Syncing...' : 'Sync Models'}</span>
@@ -178,43 +145,20 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
             className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-violet-600 hover:bg-violet-700 rounded-lg shadow-sm transition-colors cursor-pointer"
           >
             <Plus className="w-4 h-4" />
-            <span>Add Key & Fetch Models</span>
+            <span>Add Provider Key</span>
           </button>
         </div>
       </div>
 
-      {/* 2. Connected Key Sources Bar */}
-      <div className="bg-white border border-zinc-200/80 rounded-xl p-4 shadow-xs">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-zinc-100">
-          <div className="flex items-center gap-2">
-            <Key className="w-4 h-4 text-violet-600" />
-            <span className="text-xs font-semibold text-zinc-900 uppercase tracking-wider">
-              Connected API Key Sources ({providerKeys.length})
+      {/* 2. Connected Key Sources (Compact pill bar) */}
+      {providerKeys.length > 0 && (
+        <div className="bg-white border border-zinc-200/80 rounded-xl px-4 py-3 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-xs font-semibold text-zinc-500 uppercase tracking-wider flex items-center gap-1.5">
+              <Key className="w-3.5 h-3.5 text-violet-600" />
+              <span>Connected Sources:</span>
             </span>
-            <span className="text-[11px] text-zinc-400">
-              — Each key automatically queries upstream /v1/models
-            </span>
-          </div>
 
-          {selectedKeyFilter && (
-            <button
-              onClick={() => setSelectedKeyFilter(null)}
-              className="text-[11px] font-medium text-violet-600 hover:text-violet-800 flex items-center gap-1 cursor-pointer"
-            >
-              <X className="w-3 h-3" />
-              <span>Clear Key Filter</span>
-            </button>
-          )}
-        </div>
-
-        {providerKeys.length === 0 ? (
-          <div className="py-4 text-center">
-            <p className="text-xs text-zinc-500">
-              No custom provider keys connected yet. Add a Groq, OpenAI, Gemini, or OpenRouter key to unlock your models.
-            </p>
-          </div>
-        ) : (
-          <div className="flex flex-wrap items-center gap-2 pt-3">
             {providerKeys.map((pk) => {
               const isSelected = selectedKeyFilter === pk.id;
               const modelCount = pk.supportedModels?.length || 0;
@@ -222,7 +166,7 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
               return (
                 <div
                   key={pk.id}
-                  className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs transition-all ${
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs transition-all ${
                     isSelected
                       ? 'bg-violet-50 border-violet-400 text-violet-900 shadow-xs'
                       : 'bg-zinc-50 border-zinc-200/80 text-zinc-700 hover:border-zinc-300'
@@ -230,23 +174,20 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
                 >
                   <button
                     onClick={() => setSelectedKeyFilter(isSelected ? null : pk.id)}
-                    className="flex items-center gap-2 cursor-pointer text-left"
-                    title={`Click to filter models provided by ${pk.keyHint}`}
+                    className="flex items-center gap-1.5 cursor-pointer text-left"
+                    title={`Filter by ${pk.keyHint}`}
                   >
-                    <ProviderLogo provider={pk.provider} size={14} />
-                    <span className="font-semibold uppercase text-[10px] px-1.5 py-0.5 rounded bg-white border border-zinc-200 text-zinc-800">
-                      {pk.provider}
-                    </span>
+                    <ProviderLogo provider={pk.provider} size={13} />
                     <span className="font-mono text-[11px] font-medium">{pk.keyHint}</span>
                     <span className="text-[10px] font-semibold px-1.5 py-0.2 rounded-full bg-violet-100 text-violet-700">
-                      {modelCount} {modelCount === 1 ? 'model' : 'models'}
+                      {modelCount}
                     </span>
                   </button>
 
                   {onDeleteKey && (
                     <button
                       onClick={() => onDeleteKey(pk.id)}
-                      className="text-zinc-400 hover:text-rose-600 ml-1 p-0.5 rounded transition-colors cursor-pointer"
+                      className="text-zinc-400 hover:text-rose-600 ml-0.5 p-0.5 rounded transition-colors cursor-pointer"
                       title="Remove key"
                     >
                       <X className="w-3 h-3" />
@@ -256,8 +197,18 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
               );
             })}
           </div>
-        )}
-      </div>
+
+          {selectedKeyFilter && (
+            <button
+              onClick={() => setSelectedKeyFilter(null)}
+              className="text-xs font-medium text-violet-600 hover:text-violet-800 flex items-center gap-1 shrink-0 cursor-pointer self-start sm:self-auto"
+            >
+              <X className="w-3.5 h-3.5" />
+              <span>Clear Filter</span>
+            </button>
+          )}
+        </div>
+      )}
 
       {/* 3. Search & Filter Bar */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white p-3.5 rounded-xl border border-zinc-200/80 shadow-xs">
@@ -274,7 +225,7 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
 
         <div className="flex items-center gap-3">
           <span className="text-xs text-zinc-500 font-medium">
-            Showing <strong className="text-zinc-900">{filtered.length}</strong> of {models.length} models
+            Showing <strong className="text-zinc-900">{filtered.length}</strong> of {models.length}
           </span>
 
           <select
@@ -294,15 +245,15 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
         </div>
       </div>
 
-      {/* 4. Models Grid */}
+      {/* 4. Compact Clean Models Grid - Zero Clutter, Vercel/OpenAI style */}
       {filtered.length === 0 ? (
         <div className="bg-white rounded-xl border border-zinc-200/80 p-12 text-center shadow-xs">
           <div className="w-12 h-12 rounded-xl bg-violet-50 text-violet-600 flex items-center justify-center mx-auto mb-3">
             <Layers className="w-6 h-6" />
           </div>
-          <h3 className="text-base font-semibold text-zinc-900">No models match your filter</h3>
+          <h3 className="text-base font-semibold text-zinc-900">No models found</h3>
           <p className="text-xs text-zinc-500 max-w-md mx-auto mt-1 mb-4">
-            Try adjusting your search criteria or add new API keys to auto-discover models from upstream providers.
+            Try adjusting your search criteria or add new provider keys.
           </p>
           <button
             onClick={() => {
@@ -312,44 +263,46 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
             }}
             className="px-4 py-2 text-xs font-semibold text-zinc-700 bg-zinc-100 hover:bg-zinc-200 rounded-lg transition-colors cursor-pointer"
           >
-            Reset All Filters
+            Reset Filters
           </button>
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {filtered.map((m) => {
-            const contributingKeys = getKeysForModel(m.id);
             const isCopied = copiedModelId === m.id;
 
             return (
               <div
                 key={m.id}
-                className="bg-white rounded-xl border border-zinc-200/80 p-5 shadow-xs hover:border-violet-300 transition-all flex flex-col justify-between group"
+                className="bg-white rounded-xl border border-zinc-200/80 p-4 shadow-xs hover:border-violet-300 hover:shadow-sm transition-all flex flex-col justify-between group relative"
               >
                 <div>
-                  {/* Top: Dynamic Provider Logo + Model Name + Provider Badge */}
-                  <div className="flex items-start justify-between gap-2 mb-2.5">
+                  {/* Top Row: Provider Logo + Model Name + Glowing FREE Badge */}
+                  <div className="flex items-start justify-between gap-2.5 mb-3">
                     <div className="flex items-center gap-2.5 min-w-0">
-                      <div className="w-8 h-8 rounded-lg bg-zinc-50 border border-zinc-200/80 flex items-center justify-center shrink-0 shadow-2xs group-hover:border-violet-300 transition-colors">
+                      <div className="w-8 h-8 rounded-lg bg-zinc-50 border border-zinc-200/70 flex items-center justify-center shrink-0 group-hover:border-violet-200 transition-colors shadow-2xs">
                         <ProviderLogo provider={m.provider} size={18} />
                       </div>
                       <span className="font-semibold text-sm text-zinc-900 group-hover:text-violet-700 transition-colors leading-snug truncate">
                         {m.name || m.id}
                       </span>
                     </div>
-                    <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase border shrink-0 ${getProviderBadgeStyle(m.provider)}`}>
-                      {m.provider}
+
+                    {/* Glowing FREE Badge */}
+                    <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-bold tracking-wider uppercase bg-emerald-50 text-emerald-700 border border-emerald-300/80 shadow-xs shrink-0">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                      FREE
                     </span>
                   </div>
 
-                  {/* Model ID Code with Copy */}
-                  <div className="flex items-center justify-between gap-2 bg-zinc-50 px-2.5 py-1.5 rounded-lg border border-zinc-100 mb-3 group/code">
+                  {/* Model ID with 1-Click Copy Icon */}
+                  <div className="flex items-center justify-between gap-2 bg-zinc-50 group-hover:bg-zinc-100/70 px-2.5 py-1.5 rounded-lg border border-zinc-100 group-hover:border-zinc-200/80 transition-colors">
                     <code className="text-[11px] text-zinc-600 font-mono select-all truncate">
                       {m.id}
                     </code>
                     <button
                       onClick={() => handleCopy(m.id)}
-                      className="text-zinc-400 hover:text-zinc-700 p-1 rounded transition-colors shrink-0 cursor-pointer"
+                      className="text-zinc-400 hover:text-zinc-800 p-1 rounded transition-colors shrink-0 cursor-pointer"
                       title="Copy Model ID"
                     >
                       {isCopied ? (
@@ -359,47 +312,21 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
                       )}
                     </button>
                   </div>
-
-                  {/* Spec Row */}
-                  <div className="grid grid-cols-2 gap-2 text-xs text-zinc-600 py-3 border-t border-zinc-100">
-                    <div>
-                      <span className="text-[10px] text-zinc-400 block uppercase font-medium">Context Window</span>
-                      <span className="font-medium text-zinc-800">
-                        {m.contextWindow ? `${(m.contextWindow / 1000).toFixed(0)}k tokens` : '128k tokens'}
-                      </span>
-                    </div>
-                    <div>
-                      <span className="text-[10px] text-zinc-400 block uppercase font-medium">Auto-Failover</span>
-                      <span className="font-medium text-emerald-600 flex items-center gap-1">
-                        <ShieldCheck className="w-3.5 h-3.5" />
-                        Active Pool
-                      </span>
-                    </div>
-                  </div>
-
-                  {/* Key Source Tag */}
-                  <div className="pt-2 text-[11px] text-zinc-500 border-t border-zinc-100">
-                    {contributingKeys.length > 0 ? (
-                      <span className="inline-flex items-center gap-1 text-violet-700 bg-violet-50 px-2 py-0.5 rounded font-mono text-[10px]">
-                        <Key className="w-3 h-3" />
-                        Discovered via {contributingKeys.map(k => k.keyHint).join(', ')}
-                      </span>
-                    ) : (
-                      <span className="text-[10px] text-zinc-400">
-                        Auto-routed via {m.provider.toUpperCase()} Provider Pool
-                      </span>
-                    )}
-                  </div>
                 </div>
 
-                {/* Bottom Playground Action */}
-                <button
-                  onClick={() => onSelectModelForPlayground(m.id)}
-                  className="mt-4 w-full flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg border border-zinc-200 text-zinc-700 hover:bg-violet-50 hover:text-violet-700 hover:border-violet-300 text-xs font-semibold transition-colors cursor-pointer"
-                >
-                  <Terminal className="w-3.5 h-3.5" />
-                  <span>Test in Playground</span>
-                </button>
+                {/* Subtle Playground Quick Action */}
+                <div className="mt-3 pt-2.5 border-t border-zinc-100 flex items-center justify-between">
+                  <span className="text-[10px] uppercase font-bold text-zinc-400 tracking-wider">
+                    {m.provider}
+                  </span>
+                  <button
+                    onClick={() => onSelectModelForPlayground(m.id)}
+                    className="inline-flex items-center gap-1 text-[11px] font-medium text-violet-600 hover:text-violet-800 transition-colors cursor-pointer"
+                  >
+                    <Terminal className="w-3 h-3" />
+                    <span>Playground</span>
+                  </button>
+                </div>
               </div>
             );
           })}
@@ -416,8 +343,8 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
                   <Sparkles className="w-4 h-4" />
                 </div>
                 <div>
-                  <h3 className="text-base font-semibold text-zinc-900">Add API Key & Auto-Discover Models</h3>
-                  <p className="text-xs text-zinc-500">Instantly query upstream provider /v1/models and populate your catalog</p>
+                  <h3 className="text-base font-semibold text-zinc-900">Add Provider Key</h3>
+                  <p className="text-xs text-zinc-500">Auto-discover available models from upstream providers</p>
                 </div>
               </div>
               <button
@@ -457,23 +384,13 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
                   <span className="text-[11px] text-zinc-400">One key per line</span>
                 </div>
                 <textarea
-                  rows={5}
+                  rows={4}
                   value={inputKeys}
                   onChange={(e) => setInputKeys(e.target.value)}
                   placeholder={`Paste one or multiple keys:\ngsk_sample_groq_key_9201a...\nsk-proj-sample_openai_key_84bc...\nAIzaSySampleGeminiKey_47xz...`}
                   className="w-full p-3 font-mono text-xs rounded-xl border border-zinc-200 focus:border-violet-600 outline-none resize-none bg-zinc-50"
                   required
                 />
-              </div>
-
-              <div className="p-3 bg-zinc-50 rounded-xl border border-zinc-100 text-[11px] text-zinc-500 space-y-1">
-                <p className="font-semibold text-zinc-700 flex items-center gap-1.5">
-                  <Cpu className="w-3.5 h-3.5 text-violet-600" />
-                  How Auto-Discovery Works:
-                </p>
-                <p>
-                  FreeAIModel will immediately ping the provider's official <code>/v1/models</code> endpoint using the provided key(s). Any active model IDs returned will be added to your live model catalog and wired into dynamic 429 rotation.
-                </p>
               </div>
 
               {addResult && (
@@ -512,7 +429,7 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
                   ) : (
                     <>
                       <Sparkles className="w-3.5 h-3.5" />
-                      <span>Discover & Add Models</span>
+                      <span>Add & Fetch Models</span>
                     </>
                   )}
                 </button>
