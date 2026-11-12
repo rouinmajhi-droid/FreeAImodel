@@ -367,7 +367,7 @@ gatewayApp.get('/v1/models', (req: Request, res: Response) => {
     id: m.id,
     object: 'model',
     created: Math.floor(Date.now() / 1000) - 86400,
-    owned_by: m.provider,
+    owned_by: 'freeaimodel',
     permission: [{
       id: `modelperm-${m.id}`,
       object: 'model_permission',
@@ -390,6 +390,17 @@ gatewayApp.get('/v1/models', (req: Request, res: Response) => {
     object: 'list',
     data: modelList
   });
+});
+
+// Also support root endpoint GET /models
+gatewayApp.get('/models', (req: Request, res: Response) => {
+  const modelList = Array.from(masterModels.values()).map(m => ({
+    id: m.id,
+    object: 'model',
+    created: Math.floor(Date.now() / 1000) - 86400,
+    owned_by: 'freeaimodel'
+  }));
+  res.json({ object: 'list', data: modelList });
 });
 
 // ==========================================
@@ -871,9 +882,9 @@ gatewayApp.post('/api/admin/test-key', async (req: Request, res: Response) => {
   }
 });
 
-// Synchronize keys between frontend and backend gateway memory
+// Synchronize keys and models between frontend/Admin Panel and backend gateway memory
 gatewayApp.post('/api/gateway/sync', (req: Request, res: Response) => {
-  const { apiKeys, providerKeys } = req.body;
+  const { apiKeys, providerKeys, models } = req.body;
   if (Array.isArray(apiKeys)) {
     for (const k of apiKeys) {
       if (k.key) {
@@ -889,9 +900,44 @@ gatewayApp.post('/api/gateway/sync', (req: Request, res: Response) => {
       } else {
         masterProviderKeys.push(pk);
       }
+
+      // Auto-register any models supported by this provider key
+      if (Array.isArray(pk.supportedModels)) {
+        for (const modelId of pk.supportedModels) {
+          if (!masterModels.has(modelId)) {
+            masterModels.set(modelId, {
+              id: modelId,
+              name: modelId.replace(/[-_]/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
+              provider: pk.provider || 'freeaimodel',
+              discoveredAt: new Date().toISOString()
+            });
+          }
+        }
+      }
     }
   }
-  res.json({ success: true, apiKeysCount: masterApiKeys.size, providerKeysCount: masterProviderKeys.length });
+
+  if (Array.isArray(models)) {
+    for (const m of models) {
+      if (m && m.id) {
+        masterModels.set(m.id, {
+          id: m.id,
+          name: m.name || m.id,
+          provider: m.provider || 'freeaimodel',
+          discoveredAt: m.discoveredAt || new Date().toISOString(),
+          contextWindow: m.contextWindow,
+          description: m.description
+        });
+      }
+    }
+  }
+
+  res.json({ 
+    success: true, 
+    apiKeysCount: masterApiKeys.size, 
+    providerKeysCount: masterProviderKeys.length,
+    totalModels: masterModels.size
+  });
 });
 
 // Fetch system health and stats

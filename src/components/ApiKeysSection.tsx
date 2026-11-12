@@ -14,11 +14,12 @@ import {
   Sparkles,
   Terminal
 } from 'lucide-react';
-import { ApiKey } from '../types/gateway';
+import { ApiKey, GatewayModel } from '../types/gateway';
 import { useToast } from './Toast';
 
 interface ApiKeysSectionProps {
   apiKeys: ApiKey[];
+  models?: GatewayModel[];
   onCreateKey: (name: string) => Promise<ApiKey>;
   onDeleteKey: (keyId: string) => Promise<void>;
   onSelectForPlayground?: (key: string) => void;
@@ -26,6 +27,7 @@ interface ApiKeysSectionProps {
 
 export const ApiKeysSection: React.FC<ApiKeysSectionProps> = ({
   apiKeys,
+  models = [],
   onCreateKey,
   onDeleteKey,
   onSelectForPlayground,
@@ -229,76 +231,132 @@ console.log(response.choices[0].message.content);`
                   const isCopied = copiedKeyId === k.id;
                   const maskedValue = `${k.key.slice(0, 11)}••••••••••••••••${k.key.slice(-4)}`;
 
+                  const dynamicModel = models[0]?.id || 'llama-3.3-70b-versatile';
+                  const curlCodeForThisKey = `curl -X POST https://freeaimodel.vercel.app/v1/chat/completions \\
+  -H "Authorization: Bearer ${k.key}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"messages": [{"role": "user", "content": "Hello!"}], "model": "${dynamicModel}"}'`;
+
                   return (
-                    <tr key={k.id} className="hover:bg-zinc-50/70 transition-colors">
-                      <td className="py-3.5 px-5 font-medium text-zinc-900">
-                        <span className="font-semibold">{k.name}</span>
-                        <span className="text-[11px] text-zinc-400 font-mono block mt-0.5">{k.id}</span>
-                      </td>
+                    <React.Fragment key={k.id}>
+                      <tr className="hover:bg-zinc-50/70 transition-colors">
+                        <td className="py-3.5 px-5 font-medium text-zinc-900">
+                          <span className="font-semibold">{k.name}</span>
+                          <span className="text-[11px] text-zinc-400 font-mono block mt-0.5">{k.id}</span>
+                        </td>
 
-                      <td className="py-3.5 px-5">
-                        <div className="inline-flex items-center gap-1.5 font-mono text-xs bg-zinc-50 px-2.5 py-1 rounded-md border border-zinc-200 text-zinc-800">
-                          <span className="select-all font-mono">
-                            {isUnmasked ? k.key : maskedValue}
-                          </span>
-                          <button
-                            onClick={() => toggleMask(k.id)}
-                            className="text-zinc-400 hover:text-zinc-700 p-1 cursor-pointer"
-                            title={isUnmasked ? 'Mask' : 'Reveal'}
-                          >
-                            {isUnmasked ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                          </button>
-                          <button
-                            onClick={() => handleCopy(k.id, k.key)}
-                            className="text-zinc-400 hover:text-violet-600 p-1 cursor-pointer"
-                            title="Copy Key"
-                          >
-                            {isCopied ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
-                          </button>
-                        </div>
-                      </td>
-
-                      <td className="py-3.5 px-5 text-xs text-zinc-500">
-                        {new Date(k.createdAt).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' })}
-                      </td>
-
-                      <td className="py-3.5 px-5 text-xs text-zinc-500">
-                        {k.lastUsedAt ? new Date(k.lastUsedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Never'}
-                      </td>
-
-                      <td className="py-3.5 px-5">
-                        <span
-                          className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium ${
-                            k.status === 'active'
-                              ? 'bg-emerald-50 text-emerald-700 border border-emerald-200/60'
-                              : 'bg-zinc-100 text-zinc-600'
-                          }`}
-                        >
-                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-                          <span>Active</span>
-                        </span>
-                      </td>
-
-                      <td className="py-3.5 px-5 text-right">
-                        <div className="inline-flex items-center gap-2 justify-end">
-                          {onSelectForPlayground && (
+                        <td className="py-3.5 px-5">
+                          <div className="inline-flex items-center gap-1.5 font-mono text-xs bg-zinc-50 px-2.5 py-1 rounded-md border border-zinc-200 text-zinc-800">
+                            <span className="select-all font-mono">
+                              {isUnmasked ? k.key : maskedValue}
+                            </span>
                             <button
-                              onClick={() => onSelectForPlayground(k.key)}
-                              className="px-2.5 py-1 rounded-md text-xs font-medium text-violet-700 hover:bg-violet-50 transition-colors cursor-pointer"
+                              onClick={() => toggleMask(k.id)}
+                              className="text-zinc-400 hover:text-zinc-700 p-1 cursor-pointer"
+                              title={isUnmasked ? 'Mask' : 'Reveal'}
                             >
-                              Test
+                              {isUnmasked ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
                             </button>
-                          )}
-                          <button
-                            onClick={() => setDeleteConfirmId(k.id)}
-                            className="text-zinc-400 hover:text-rose-600 p-1.5 rounded-md hover:bg-rose-50 transition-colors cursor-pointer"
-                            title="Revoke / Delete"
+                            <button
+                              onClick={() => handleCopy(k.id, k.key)}
+                              className="text-zinc-400 hover:text-violet-600 p-1 cursor-pointer"
+                              title="Copy Key"
+                            >
+                              {isCopied ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                            </button>
+                          </div>
+                        </td>
+
+                        <td className="py-3.5 px-5 text-xs text-zinc-500">
+                          {new Date(k.createdAt).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' })}
+                        </td>
+
+                        <td className="py-3.5 px-5 text-xs text-zinc-500">
+                          {k.lastUsedAt ? new Date(k.lastUsedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Never'}
+                        </td>
+
+                        <td className="py-3.5 px-5">
+                          <span
+                            className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium ${
+                              k.status === 'active'
+                                ? 'bg-emerald-50 text-emerald-700 border border-emerald-200/60'
+                                : 'bg-zinc-100 text-zinc-600'
+                            }`}
                           >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
+                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                            <span>Active</span>
+                          </span>
+                        </td>
+
+                        <td className="py-3.5 px-5 text-right">
+                          <div className="inline-flex items-center gap-2 justify-end">
+                            {onSelectForPlayground && (
+                              <button
+                                onClick={() => onSelectForPlayground(k.key)}
+                                className="px-2.5 py-1 rounded-md text-xs font-medium text-violet-700 hover:bg-violet-50 transition-colors cursor-pointer"
+                              >
+                                Test
+                              </button>
+                            )}
+                            <button
+                              onClick={() => setDeleteConfirmId(k.id)}
+                              className="text-zinc-400 hover:text-rose-600 p-1.5 rounded-md hover:bg-rose-50 transition-colors cursor-pointer"
+                              title="Revoke / Delete"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+
+                      {/* Clean, Copyable cURL Code Block & Base URL directly below each generated API Key */}
+                      <tr className="bg-zinc-50/50">
+                        <td colSpan={6} className="px-5 py-3 border-b border-zinc-100">
+                          <div className="rounded-xl border border-zinc-200/80 bg-zinc-900 text-zinc-100 p-3.5 shadow-xs font-mono text-xs space-y-2.5">
+                            {/* Base URL separate bar */}
+                            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-2.5 border-b border-zinc-800 text-[11px]">
+                              <div className="flex items-center gap-2">
+                                <span className="text-zinc-400 font-sans font-medium">Base URL:</span>
+                                <span className="text-cyan-300 font-bold select-all bg-zinc-800/80 px-2 py-0.5 rounded border border-zinc-700/60">
+                                  https://freeaimodel.vercel.app/v1
+                                </span>
+                              </div>
+                              <button
+                                onClick={() => {
+                                  navigator.clipboard.writeText('https://freeaimodel.vercel.app/v1');
+                                  showToast('Copied', 'Base URL (https://freeaimodel.vercel.app/v1) copied to clipboard.', 'success');
+                                }}
+                                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-sans font-medium transition-colors cursor-pointer w-fit"
+                              >
+                                <Copy className="w-3 h-3 text-zinc-400" />
+                                <span>Copy Base URL</span>
+                              </button>
+                            </div>
+
+                            {/* cURL Command Block */}
+                            <div className="flex items-start justify-between gap-3">
+                              <pre className="text-xs text-zinc-200 overflow-x-auto whitespace-pre-wrap leading-relaxed select-all">
+                                <span className="text-emerald-400 font-semibold">curl</span> -X <span className="text-cyan-400 font-bold">POST</span> https://freeaimodel.vercel.app/v1/chat/completions \<br />
+                                {'  '}-H <span className="text-amber-300">"Authorization: Bearer <span className="text-cyan-300 font-bold">{k.key}</span>"</span> \<br />
+                                {'  '}-H <span className="text-amber-300">"Content-Type: application/json"</span> \<br />
+                                {'  '}-d <span className="text-emerald-300">'{`{"messages": [{"role": "user", "content": "Hello!"}], "model": "${dynamicModel}"}`}'</span>
+                              </pre>
+
+                              <button
+                                onClick={() => {
+                                  navigator.clipboard.writeText(curlCodeForThisKey);
+                                  showToast('cURL Copied', 'cURL command copied with your active API key.', 'success');
+                                }}
+                                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-violet-600 hover:bg-violet-700 text-white text-xs font-sans font-semibold shrink-0 transition-colors shadow-xs cursor-pointer"
+                              >
+                                <Copy className="w-3.5 h-3.5" />
+                                <span>Copy cURL</span>
+                              </button>
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    </React.Fragment>
                   );
                 })}
               </tbody>

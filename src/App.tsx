@@ -91,13 +91,17 @@ function GatewayApp() {
     }
   };
 
-  // Sync state with backend memory router
-  const syncWithBackend = useCallback(async (currentApiKeys: ApiKey[], currentProviderKeys: ProviderKey[]) => {
+  // Sync state with backend memory router (keys + models from Admin Panel)
+  const syncWithBackend = useCallback(async (currentApiKeys: ApiKey[], currentProviderKeys: ProviderKey[], currentModels?: GatewayModel[]) => {
     try {
       await fetch('/api/gateway/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ apiKeys: currentApiKeys, providerKeys: currentProviderKeys })
+        body: JSON.stringify({ 
+          apiKeys: currentApiKeys, 
+          providerKeys: currentProviderKeys,
+          models: currentModels
+        })
       });
     } catch (e) {
       // background sync
@@ -545,6 +549,7 @@ function GatewayApp() {
           {activeTab === 'keys' && (
             <ApiKeysSection
               apiKeys={apiKeys}
+              models={models}
               onCreateKey={handleCreateApiKey}
               onDeleteKey={handleDeleteApiKey}
               onSelectForPlayground={(key) => {
