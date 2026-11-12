@@ -87,8 +87,8 @@ export const ApiKeysSection: React.FC<ApiKeysSectionProps> = ({
   const liveOrigin = typeof window !== 'undefined' && window.location.origin
     ? window.location.origin
     : 'https://ais-dev-v74yl6dga5jcxwtppiqoqk-861257782865.asia-southeast1.run.app';
-  const customDomain = 'https://yourdomain.com';
-  const baseUrl = useLiveUrl ? customDomain : liveOrigin;
+  const customDomain = 'https://freeaimodel.org';
+  const baseUrl = useLiveUrl ? liveOrigin : customDomain;
 
   // Seamlessly populate the user's active API key
   const activeKeyToken = justCreatedKey?.key || apiKeys[0]?.key || 'sk-gateway-live-your_token_here';

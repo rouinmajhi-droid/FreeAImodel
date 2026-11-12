@@ -37,8 +37,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
     { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
     { id: 'keys', label: 'API Keys', icon: Key },
     { id: 'playground', label: 'Playground', icon: Terminal },
-    { id: 'settings', label: 'Settings', icon: Settings },
     { id: 'models', label: 'Models', icon: Layers },
+    ...(isAdmin ? [{ id: 'admin' as NavTab, label: 'Admin Panel', icon: ShieldCheck, badge: 'Staff' }] : []),
+    { id: 'settings', label: 'Settings', icon: Settings },
   ];
 
   return (
