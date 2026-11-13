@@ -1,6 +1,7 @@
 import express, { Request, Response, NextFunction } from 'express';
 import dotenv from 'dotenv';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 dotenv.config();
@@ -8,11 +9,11 @@ dotenv.config();
 export const gatewayApp = express();
 
 // ==========================================
-// Explicit CORS & Preflight Headers for all gateway routes
+// Explicit CORS & Preflight Headers for all gateway routes (/v1/*, /api/*, /models)
 // ==========================================
 gatewayApp.use((req: Request, res: Response, next: NextFunction) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, DELETE, PATCH');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key, x-user-email');
   if (req.method === 'OPTIONS') {
     res.status(204).end();
@@ -139,13 +140,7 @@ export const masterLogs: StoredRequestLog[] = [];
 export const masterUsers = new Map<string, StoredUserAccount>();
 
 function getCacheFilePath(): string {
-  const cwdPath = path.resolve(process.cwd(), '.gateway-cache.json');
-  try {
-    fs.accessSync(process.cwd(), fs.constants.W_OK);
-    return cwdPath;
-  } catch {
-    return '/tmp/.gateway-cache.json';
-  }
+  return path.join(os.tmpdir(), '.gateway-cache.json');
 }
 
 export function saveGatewayCache(): void {
@@ -168,7 +163,7 @@ export function saveGatewayCache(): void {
 function loadGatewayCache(): void {
   try {
     const candidates = [
-      path.resolve(process.cwd(), '.gateway-cache.json'),
+      path.join(os.tmpdir(), '.gateway-cache.json'),
       '/tmp/.gateway-cache.json'
     ];
     for (const filePath of candidates) {
@@ -670,22 +665,115 @@ const handleChatCompletions = async (req: Request, res: Response) => {
     return true;
   });
 
-  const modelRecord = masterModels.get(model);
-  const modelProvider = modelRecord?.provider;
+  // Resolve requested model: exact -> case-insensitive -> fallback to first available active synced model
+  let effectiveModel = String(model).trim();
+  let usedFallbackModel = false;
 
-  let candidateKeys = availableKeys.filter(k => {
-    const ownsModel = (Array.isArray(k.supportedModels) && k.supportedModels.includes(model)) ||
-      (modelRecord?.ownerKeyId && k.id === modelRecord.ownerKeyId);
-    const sameProvider = modelProvider && k.provider === modelProvider;
-    return ownsModel || sameProvider;
-  });
+  let modelRecord = masterModels.get(effectiveModel);
+  if (!modelRecord) {
+    const lowerReq = effectiveModel.toLowerCase();
+    for (const [id, rec] of masterModels.entries()) {
+      if (id.toLowerCase() === lowerReq) {
+        effectiveModel = id;
+        modelRecord = rec;
+        break;
+      }
+    }
+  }
 
-  candidateKeys.sort((a, b) => {
-    const aOwns = (a.supportedModels?.includes(model) || a.id === modelRecord?.ownerKeyId) ? 1 : 0;
-    const bOwns = (b.supportedModels?.includes(model) || b.id === modelRecord?.ownerKeyId) ? 1 : 0;
-    if (aOwns !== bOwns) return bOwns - aOwns;
-    return (a.errorCount || 0) - (b.errorCount || 0);
-  });
+  let modelProvider = modelRecord?.provider;
+
+  const findKeysForModel = (targetModelId: string, targetRecord?: StoredModel) => {
+    const targetProvider = targetRecord?.provider;
+    const keys = availableKeys.filter(k => {
+      const ownsModel = (Array.isArray(k.supportedModels) && k.supportedModels.includes(targetModelId)) ||
+        (targetRecord?.ownerKeyId && k.id === targetRecord.ownerKeyId);
+      const sameProvider = targetProvider && k.provider === targetProvider;
+      return ownsModel || sameProvider;
+    });
+    keys.sort((a, b) => {
+      const aOwns = (a.supportedModels?.includes(targetModelId) || a.id === targetRecord?.ownerKeyId) ? 1 : 0;
+      const bOwns = (b.supportedModels?.includes(targetModelId) || b.id === targetRecord?.ownerKeyId) ? 1 : 0;
+      if (aOwns !== bOwns) return bOwns - aOwns;
+      return (a.errorCount || 0) - (b.errorCount || 0);
+    });
+    return keys;
+  };
+
+  let candidateKeys = findKeysForModel(effectiveModel, modelRecord);
+
+  // Automatic Fallback Model Routing:
+  // If requested model doesn't match any active pool key (e.g. 'plugsky-micro', 'gpt-4'),
+  // route to the first available chat-capable active synced model in the Master Pool instead of returning 404.
+  if (candidateKeys.length === 0 && availableKeys.length > 0) {
+    const NON_CHAT_MODEL_RE = /realtime|tts|whisper|transcribe|image|dall-e|sora|embedding|moderation|gpt-audio|gpt-live|diarize/i;
+    const PREFERRED_CHAT_IDS = [
+      'gpt-4o-mini',
+      'gpt-4o',
+      'gpt-4.1-mini',
+      'gpt-4.1',
+      'gpt-5-mini',
+      'gpt-5',
+      'llama-3.3-70b-versatile',
+      'llama-3.1-8b-instant',
+      'gemini-2.5-flash',
+      'gemini-2.0-flash',
+      'deepseek-chat',
+      'mercury'
+    ];
+
+    const routableEntries: Array<{ id: string; record: StoredModel }> = [];
+    for (const m of masterModels.values()) {
+      if (findKeysForModel(m.id, m).length > 0) {
+        routableEntries.push({ id: m.id, record: m });
+      }
+    }
+
+    if (routableEntries.length === 0) {
+      for (const k of availableKeys) {
+        if (Array.isArray(k.supportedModels)) {
+          for (const rawId of k.supportedModels) {
+            const id = String(rawId).trim();
+            if (!id) continue;
+            routableEntries.push({
+              id,
+              record: masterModels.get(id) || {
+                id,
+                name: formatModelDisplayName(id),
+                provider: k.provider,
+                ownerKeyId: k.id,
+                ownerKeyHint: k.keyHint,
+                discoveredAt: new Date().toISOString()
+              }
+            });
+          }
+        }
+      }
+    }
+
+    let picked: { id: string; record: StoredModel } | undefined;
+    for (const preferredId of PREFERRED_CHAT_IDS) {
+      picked = routableEntries.find(entry => entry.id.toLowerCase() === preferredId);
+      if (picked) break;
+    }
+    if (!picked) {
+      picked = routableEntries.find(entry => !NON_CHAT_MODEL_RE.test(entry.id));
+    }
+    if (!picked) {
+      picked = routableEntries[0];
+    }
+
+    if (picked) {
+      usedFallbackModel = true;
+      effectiveModel = picked.id;
+      modelRecord = picked.record;
+      modelProvider = picked.record.provider;
+      candidateKeys = findKeysForModel(effectiveModel, modelRecord);
+    } else {
+      // No synced models exist yet on the active keys; try available keys cleanly
+      candidateKeys = [...availableKeys];
+    }
+  }
 
   let success = false;
   let failoverCount = 0;
@@ -721,7 +809,7 @@ const handleChatCompletions = async (req: Request, res: Response) => {
           content: m.content
         }));
         upstreamPayload = {
-          model,
+          model: effectiveModel,
           messages: nonSysMsgs,
           max_tokens: max_tokens ?? 2048,
           temperature: temperature ?? 0.7,
@@ -735,7 +823,7 @@ const handleChatCompletions = async (req: Request, res: Response) => {
           'User-Agent': 'FreeAIModel-Gateway/1.0'
         };
         upstreamPayload = {
-          model,
+          model: effectiveModel,
           messages,
           stream: Boolean(stream)
         };
@@ -782,6 +870,8 @@ const handleChatCompletions = async (req: Request, res: Response) => {
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
         res.setHeader('x-gateway-provider', providerKey.provider);
+        res.setHeader('x-gateway-model', effectiveModel);
+        res.setHeader('x-gateway-fallback', usedFallbackModel ? 'true' : 'false');
         res.setHeader('x-gateway-failover-count', String(failoverCount));
 
         if (upstreamResponse.body) {
@@ -813,7 +903,7 @@ const handleChatCompletions = async (req: Request, res: Response) => {
           id: data.id || 'chatcmpl-' + Math.random().toString(36).substring(2, 10),
           object: 'chat.completion',
           created: Math.floor(Date.now() / 1000),
-          model,
+          model: effectiveModel,
           choices: [{
             index: 0,
             message: { role: 'assistant', content: text },
@@ -837,12 +927,17 @@ const handleChatCompletions = async (req: Request, res: Response) => {
 
       data.gateway_meta = {
         provider_used: providerKey.provider,
+        requested_model: model,
+        routed_model: effectiveModel,
+        fallback_routed: usedFallbackModel,
         failover_count: failoverCount,
         latency_ms: Date.now() - startTime,
         cost_usd: (promptTokens * 0.000002) + (completionTokens * 0.000006)
       };
 
       res.setHeader('x-gateway-provider', providerKey.provider);
+      res.setHeader('x-gateway-model', effectiveModel);
+      res.setHeader('x-gateway-fallback', usedFallbackModel ? 'true' : 'false');
       res.setHeader('x-gateway-failover-count', String(failoverCount));
       res.json(data);
       success = true;
@@ -858,14 +953,16 @@ const handleChatCompletions = async (req: Request, res: Response) => {
   if (!success) {
     const statusToSend = candidateKeys.length === 0 ? 404 : (lastErrorStatus >= 400 ? lastErrorStatus : 502);
     const errorMessage = candidateKeys.length === 0
-      ? `No active Admin Pool provider key owns model "${model}". Add a valid provider API key in the Admin Panel (/admin) first.`
-      : `Upstream request for "${model}" failed after ${failoverCount} attempt(s): ${lastErrorMsg.slice(0, 220)}`;
+      ? `No active Admin Pool provider keys are configured yet to handle "${model}". Add a valid provider API key in the Admin Panel (/admin).`
+      : `Upstream request for "${effectiveModel}" failed after ${failoverCount} attempt(s): ${lastErrorMsg.slice(0, 220)}`;
 
     res.status(statusToSend).json({
       error: {
         message: errorMessage,
         type: candidateKeys.length === 0 ? 'model_not_found' : 'gateway_upstream_error',
         code: candidateKeys.length === 0 ? 'model_not_found' : 'upstream_failed',
+        requested_model: model,
+        routed_model: effectiveModel,
         failover_count: failoverCount
       }
     });
@@ -883,7 +980,7 @@ const handleChatCompletions = async (req: Request, res: Response) => {
     id: 'log_' + Math.random().toString(36).substring(2, 10),
     userId: apiKeyRecord.userId,
     apiKeyId: apiKeyRecord.id,
-    model,
+    model: effectiveModel,
     provider: providerUsed,
     promptTokens,
     completionTokens,
