@@ -225,17 +225,23 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             </p>
 
             <div className="space-y-2">
-              {models.slice(0, 4).map((m) => (
-                <div key={m.id} className="flex items-center justify-between text-xs py-1.5 px-2 rounded-md hover:bg-zinc-50">
-                  <div className="flex items-center gap-2 min-w-0">
-                    <ProviderLogo provider={m.provider} size={15} />
-                    <span className="font-medium text-zinc-800 truncate">{m.name || m.id}</span>
-                  </div>
-                  <span className="text-[10px] font-bold text-emerald-600 bg-emerald-50 border border-emerald-200/80 px-1.5 py-0.2 rounded-full">
-                    FREE
-                  </span>
+              {models.length === 0 ? (
+                <div className="p-4 rounded-lg bg-zinc-50 border border-dashed border-zinc-200 text-center text-xs text-zinc-500">
+                  No live models synced yet. Live models appear automatically once valid provider keys are connected in Admin.
                 </div>
-              ))}
+              ) : (
+                models.slice(0, 4).map((m) => (
+                  <div key={m.id} className="flex items-center justify-between text-xs py-1.5 px-2 rounded-md hover:bg-zinc-50">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <ProviderLogo provider={m.provider} size={15} />
+                      <span className="font-medium text-zinc-800 truncate">{m.name || m.id}</span>
+                    </div>
+                    <span className="text-[10px] font-bold text-emerald-600 bg-emerald-50 border border-emerald-200/80 px-1.5 py-0.2 rounded-full">
+                      FREE
+                    </span>
+                  </div>
+                ))
+              )}
             </div>
           </div>
 

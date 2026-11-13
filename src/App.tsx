@@ -26,10 +26,11 @@ import { OverviewView } from './components/OverviewView';
 import { ApiKeysSection } from './components/ApiKeysSection';
 import { Playground } from './components/Playground';
 import { ModelsView } from './components/ModelsView';
-import { AdminPanel } from './components/AdminPanel';
+import { StandaloneAdminDashboard } from './components/StandaloneAdminDashboard';
 import { SettingsView } from './components/SettingsView';
 import { LoginModal } from './components/LoginModal';
 import { LandingPage } from './components/LandingPage';
+import { parseJsonSafe } from './lib/http';
 
 function GatewayApp() {
   const { showToast } = useToast();
@@ -269,13 +270,15 @@ function GatewayApp() {
       try {
         const res = await fetch('/api/models');
         if (res.ok) {
-          const data = await res.json();
+          const data = await parseJsonSafe(res);
           if (Array.isArray(data.data)) {
             loadedModels = data.data.map((m: any) => ({
               id: m.id,
               name: m.name || m.id.replace(/[-_]/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
-              provider: m.provider || m.owned_by || 'groq',
-              discoveredAt: new Date().toISOString()
+              provider: m.provider || m.owned_by || 'custom',
+              ownerKeyId: m.ownerKeyId,
+              ownerKeyHint: m.ownerKeyHint,
+              discoveredAt: m.discoveredAt || new Date().toISOString()
             }));
           }
         }
@@ -287,7 +290,7 @@ function GatewayApp() {
       try {
         const statsRes = await fetch('/api/stats');
         if (statsRes.ok) {
-          const statsData = await statsRes.json();
+          const statsData = await parseJsonSafe(statsRes);
           if (!cancelled && Array.isArray(statsData.logs)) {
             setRequestLogs(statsData.logs);
           }
@@ -296,7 +299,7 @@ function GatewayApp() {
         // Ignore
       }
 
-      // 3. When authenticated with Firebase, load user's persisted API keys, models & (if admin) provider pool
+      // 3. When authenticated with Firebase, load user's persisted API keys, real models & (if admin) provider pool
       if (currentUser) {
         try {
           const keysQ = query(collection(db, 'api_keys'), where('userId', '==', currentUser.uid));
@@ -310,16 +313,21 @@ function GatewayApp() {
           }
         }
 
-        try {
-          const modelsSnap = await getDocs(collection(db, 'models'));
-          if (!modelsSnap.empty) {
-            const firestoreModels = modelsSnap.docs.map(d => d.data() as GatewayModel);
-            if (firestoreModels.length > 0) {
-              loadedModels = firestoreModels;
+        // Only hydrate live-discovered models (with ownerKeyId) from Firestore if backend memory is empty
+        if (loadedModels.length === 0) {
+          try {
+            const modelsSnap = await getDocs(collection(db, 'models'));
+            if (!modelsSnap.empty) {
+              const firestoreModels = modelsSnap.docs
+                .map(d => d.data() as GatewayModel)
+                .filter(m => Boolean(m.ownerKeyId));
+              if (firestoreModels.length > 0) {
+                loadedModels = firestoreModels;
+              }
             }
+          } catch (err) {
+            console.warn('Could not read models from Firestore:', err);
           }
-        } catch (err) {
-          console.warn('Could not read models from Firestore:', err);
         }
 
         if (isAdmin) {
@@ -332,7 +340,7 @@ function GatewayApp() {
               headers: { 'x-user-email': currentUser.email || '' }
             }).catch(() => null);
             const backendPool: ProviderKey[] = adminKeysRes && adminKeysRes.ok
-              ? ((await adminKeysRes.json()).keys || [])
+              ? ((await parseJsonSafe(adminKeysRes)).keys || [])
               : [];
 
             const mergedMap = new Map<string, ProviderKey>();
@@ -347,15 +355,21 @@ function GatewayApp() {
 
       if (cancelled) return;
 
+      // If admin has 0 provider keys, ensure loadedModels is strictly empty and purge stale Firestore models
+      if (isAdmin && loadedProviderKeys.length === 0) {
+        loadedModels = [];
+        syncModelsToFirestore([]).catch(() => {});
+      }
+
       setModels(loadedModels);
       setApiKeys(loadedApiKeys);
       setProviderKeys(loadedProviderKeys);
 
       await syncWithBackend(
         loadedApiKeys,
-        loadedProviderKeys,
+        isAdmin ? loadedProviderKeys : [],
         loadedModels,
-        loadedProviderKeys.length > 0
+        isAdmin
       );
 
       // Re-read backend models in case backend rebuilt from synced provider keys
@@ -363,13 +377,15 @@ function GatewayApp() {
         try {
           const refreshedRes = await fetch('/api/models');
           if (refreshedRes.ok) {
-            const refreshedData = await refreshedRes.json();
+            const refreshedData = await parseJsonSafe(refreshedRes);
             if (!cancelled && Array.isArray(refreshedData.data)) {
               setModels(refreshedData.data.map((m: any) => ({
                 id: m.id,
                 name: m.name || m.id.replace(/[-_]/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
-                provider: m.provider || m.owned_by || 'groq',
-                discoveredAt: new Date().toISOString()
+                provider: m.provider || m.owned_by || 'custom',
+                ownerKeyId: m.ownerKeyId,
+                ownerKeyHint: m.ownerKeyHint,
+                discoveredAt: m.discoveredAt || new Date().toISOString()
               })));
             }
           }
@@ -485,7 +501,7 @@ function GatewayApp() {
     }
   }, [currentUser, isAdmin]);
 
-  // Admin Bulk Add Provider Keys & Auto-Discover Models
+  // Admin Bulk Add Provider Keys & Auto-Discover Models (safe JSON parsing)
   const handleAddBulkProviderKeys = async (keysText: string, provider: string, customBaseUrl?: string) => {
     const res = await fetch('/api/admin/bulk-add-keys', {
       method: 'POST',
@@ -496,12 +512,7 @@ function GatewayApp() {
       body: JSON.stringify({ keysText, provider, customBaseUrl })
     });
 
-    if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.error || 'Bulk ingestion failed');
-    }
-
-    const data = await res.json();
+    const data = await parseJsonSafe(res);
 
     let nextModels: GatewayModel[] = [];
     if (Array.isArray(data.models)) {
@@ -518,7 +529,7 @@ function GatewayApp() {
     } else {
       const modelsRes = await fetch('/api/models');
       if (modelsRes.ok) {
-        const modelsData = await modelsRes.json();
+        const modelsData = await parseJsonSafe(modelsRes);
         if (Array.isArray(modelsData.data)) {
           nextModels = modelsData.data.map((m: any) => ({
             id: m.id,
@@ -563,7 +574,8 @@ function GatewayApp() {
 
     return {
       addedCount: data.addedCount || 0,
-      modelsCount: Object.values(data.discoveredModelsSummary || {}).flat().length
+      modelsCount: Object.values(data.discoveredModelsSummary || {}).flat().length,
+      discoveryErrors: data.discoveryErrors as Record<string, string> | undefined
     };
   };
 
@@ -582,7 +594,7 @@ function GatewayApp() {
         body: JSON.stringify({ status: newStatus })
       });
       if (res.ok) {
-        const data = await res.json();
+        const data = await parseJsonSafe(res);
         if (Array.isArray(data.models)) {
           setModels(data.models);
           await syncModelsToFirestore(data.models);
@@ -618,7 +630,7 @@ function GatewayApp() {
         headers: { 'x-user-email': activeEmail || '' }
       });
       if (res.ok) {
-        const data = await res.json();
+        const data = await parseJsonSafe(res);
         if (Array.isArray(data.models)) {
           setModels(data.models);
           await syncModelsToFirestore(data.models);
@@ -649,35 +661,34 @@ function GatewayApp() {
   const handleRefreshModels = async () => {
     try {
       const res = await fetch('/api/models/refresh', { method: 'POST' });
-      if (res.ok) {
-        const data = await res.json();
-        if (Array.isArray(data.models)) {
-          const nextModels: GatewayModel[] = data.models.map((m: any) => ({
-            id: m.id,
-            name: m.name || m.id.replace(/[-_]/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
-            provider: m.provider || 'custom',
-            ownerKeyId: m.ownerKeyId,
-            ownerKeyHint: m.ownerKeyHint,
-            discoveredAt: m.discoveredAt || new Date().toISOString()
-          }));
-          setModels(nextModels);
+      const data = await parseJsonSafe(res);
+      if (Array.isArray(data.models)) {
+        const nextModels: GatewayModel[] = data.models.map((m: any) => ({
+          id: m.id,
+          name: m.name || m.id.replace(/[-_]/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
+          provider: m.provider || 'custom',
+          ownerKeyId: m.ownerKeyId,
+          ownerKeyHint: m.ownerKeyHint,
+          discoveredAt: m.discoveredAt || new Date().toISOString()
+        }));
+        setModels(nextModels);
+        if (isAdmin) {
           await syncModelsToFirestore(nextModels);
-          showToast('Models Refreshed', `${nextModels.length} models synced from provider keys.`, 'success');
-          return;
         }
+        showToast('Models Synced', `${nextModels.length} live model(s) synced from active keys.`, 'success');
+        return;
       }
+
       const fallbackRes = await fetch('/api/models');
-      if (fallbackRes.ok) {
-        const fallbackData = await fallbackRes.json();
-        if (Array.isArray(fallbackData.data)) {
-          setModels(fallbackData.data.map((m: any) => ({
-            id: m.id,
-            name: m.name || m.id.replace(/[-_]/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
-            provider: m.provider || m.owned_by || 'groq',
-            discoveredAt: new Date().toISOString()
-          })));
-          showToast('Models Refreshed', `${fallbackData.data.length} models discoverable.`, 'success');
-        }
+      const fallbackData = await parseJsonSafe(fallbackRes);
+      if (Array.isArray(fallbackData.data)) {
+        setModels(fallbackData.data.map((m: any) => ({
+          id: m.id,
+          name: m.name || m.id.replace(/[-_]/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
+          provider: m.provider || m.owned_by || 'custom',
+          discoveredAt: new Date().toISOString()
+        })));
+        showToast('Models Refreshed', `${fallbackData.data.length} live model(s) loaded.`, 'success');
       }
     } catch (e: any) {
       showToast('Refresh Error', e.message, 'error');
@@ -775,6 +786,27 @@ function GatewayApp() {
     );
   }
 
+  // Standalone /admin layout (completely separate from the User Dashboard layout)
+  if (activeTab === 'admin') {
+    return (
+      <StandaloneAdminDashboard
+        userEmail={activeEmail}
+        userDisplayName={currentUser?.displayName || devUser?.displayName}
+        isAdmin={isAdmin}
+        providerKeys={providerKeys}
+        models={models}
+        logs={requestLogs}
+        onAddBulkKeys={handleAddBulkProviderKeys}
+        onToggleKeyStatus={handleToggleKeyStatus}
+        onDeleteProviderKey={handleDeleteProviderKey}
+        onResetCooldowns={handleResetCooldowns}
+        onRefreshModels={handleRefreshModels}
+        onReturnToUserApp={() => handleSelectTab('dashboard')}
+        onLogout={handleSignOut}
+      />
+    );
+  }
+
   return (
     <div className="min-h-screen bg-[#FAF9F6] text-zinc-900 flex antialiased">
       {/* 1. Permanent Pinned Left Sidebar (width: 260px) */}
@@ -846,27 +878,13 @@ function GatewayApp() {
             <ModelsView
               models={models}
               providerKeys={providerKeys}
-              onSelectModelForPlayground={(modelId) => {
+              isAdmin={isAdmin}
+              onSelectModelForPlayground={() => {
                 handleSelectTab('playground');
               }}
               onAddKeyAndFetchModels={handleAddBulkProviderKeys}
               onRefreshModels={handleRefreshModels}
               onDeleteKey={handleDeleteProviderKey}
-            />
-          )}
-
-          {activeTab === 'admin' && isAdmin && (
-            <AdminPanel
-              userEmail={activeEmail}
-              isAdmin={isAdmin}
-              providerKeys={providerKeys}
-              models={models}
-              logs={requestLogs}
-              onAddBulkKeys={handleAddBulkProviderKeys}
-              onToggleKeyStatus={handleToggleKeyStatus}
-              onDeleteProviderKey={handleDeleteProviderKey}
-              onResetCooldowns={handleResetCooldowns}
-              onRefreshModels={handleRefreshModels}
             />
           )}
 

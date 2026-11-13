@@ -92,9 +92,9 @@ export const ApiKeysSection: React.FC<ApiKeysSectionProps> = ({
   const customDomain = 'https://freeaimodel.vercel.app';
   const baseUrl = useLiveUrl ? liveOrigin : customDomain;
 
-  // Seamlessly populate the user's active API key and dynamic admin model
+  // Seamlessly populate the user's active API key and live discovered model
   const activeKeyToken = justCreatedKey?.key || apiKeys[0]?.key || 'sk-gateway-live-your_token_here';
-  const defaultDynamicModel = models[0]?.id || 'llama-3.3-70b-versatile';
+  const defaultDynamicModel = models[0]?.id || 'YOUR_ACTIVE_MODEL_ID';
 
   const snippets = {
     curl: `curl -X POST ${baseUrl}/v1/chat/completions \\
@@ -226,7 +226,7 @@ console.log(response.choices[0].message.content);`
                   const isCopied = copiedKeyId === k.id;
                   const maskedValue = `${k.key.slice(0, 11)}••••••••••••••••${k.key.slice(-4)}`;
 
-                  const dynamicModel = models[0]?.id || 'llama-3.3-70b-versatile';
+                  const dynamicModel = models[0]?.id || 'YOUR_ACTIVE_MODEL_ID';
                   const curlCodeForThisKey = `curl -X POST https://freeaimodel.vercel.app/v1/chat/completions \\
   -H "Authorization: Bearer ${k.key}" \\
   -H "Content-Type: application/json" \\

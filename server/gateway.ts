@@ -117,7 +117,7 @@ export function ensureDailyCreditsReset(account: StoredUserAccount): boolean {
 }
 
 // ==========================================
-// In-memory Master Stores + File Persistence Cache
+// In-memory Master Stores + File Persistence Cache (Zero Fake/Demo Seed Models)
 // ==========================================
 export const masterApiKeys = new Map<string, StoredApiKey>();
 export const masterProviderKeys: StoredProviderKey[] = [];
@@ -125,24 +125,9 @@ export const masterModels = new Map<string, StoredModel>();
 export const masterLogs: StoredRequestLog[] = [];
 export const masterUsers = new Map<string, StoredUserAccount>();
 
-const defaultInitialModels: StoredModel[] = [
-  { id: 'llama-3.3-70b-versatile', name: 'Llama 3.3 70B Versatile', provider: 'groq', contextWindow: 128000, pricingPrompt: 0.00059, pricingCompletion: 0.00079, discoveredAt: new Date().toISOString() },
-  { id: 'llama-3.1-8b-instant', name: 'Llama 3.1 8B Instant', provider: 'groq', contextWindow: 128000, pricingPrompt: 0.00005, pricingCompletion: 0.00008, discoveredAt: new Date().toISOString() },
-  { id: 'gpt-4o', name: 'GPT-4o Omnimodel', provider: 'openai', contextWindow: 128000, pricingPrompt: 0.0025, pricingCompletion: 0.010, discoveredAt: new Date().toISOString() },
-  { id: 'gpt-4o-mini', name: 'GPT-4o Mini', provider: 'openai', contextWindow: 128000, pricingPrompt: 0.00015, pricingCompletion: 0.0006, discoveredAt: new Date().toISOString() },
-  { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash', provider: 'gemini', contextWindow: 1048576, pricingPrompt: 0.0001, pricingCompletion: 0.0004, discoveredAt: new Date().toISOString() },
-  { id: 'gemini-1.5-pro', name: 'Gemini 1.5 Pro', provider: 'gemini', contextWindow: 2097152, pricingPrompt: 0.00125, pricingCompletion: 0.005, discoveredAt: new Date().toISOString() },
-  { id: 'deepseek-chat', name: 'DeepSeek-V3 Chat', provider: 'deepseek', contextWindow: 64000, pricingPrompt: 0.00014, pricingCompletion: 0.00028, discoveredAt: new Date().toISOString() },
-  { id: 'deepseek-reasoner', name: 'DeepSeek-R1 Reasoner', provider: 'deepseek', contextWindow: 64000, pricingPrompt: 0.00055, pricingCompletion: 0.00219, discoveredAt: new Date().toISOString() },
-  { id: 'mistral-large-latest', name: 'Mistral Large 2', provider: 'mistral', contextWindow: 128000, pricingPrompt: 0.002, pricingCompletion: 0.006, discoveredAt: new Date().toISOString() },
-  { id: 'mercury-coder-small', name: 'Mercury Coder Small', provider: 'inception', contextWindow: 128000, pricingPrompt: 0.0002, pricingCompletion: 0.0006, discoveredAt: new Date().toISOString() },
-  { id: 'llama-3.3-70b', name: 'Cerebras Llama 3.3 70B Ultra-Fast', provider: 'cerebras', contextWindow: 8192, pricingPrompt: 0.0006, pricingCompletion: 0.0006, discoveredAt: new Date().toISOString() }
-];
-
 function getCacheFilePath(): string {
   const cwdPath = path.resolve(process.cwd(), '.gateway-cache.json');
   try {
-    // Check if cwd is writable (not read-only serverless bundle)
     fs.accessSync(process.cwd(), fs.constants.W_OK);
     return cwdPath;
   } catch {
@@ -162,8 +147,8 @@ export function saveGatewayCache(): void {
       updatedAt: new Date().toISOString()
     };
     fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf-8');
-  } catch (err) {
-    // Non-fatal in constrained environments
+  } catch {
+    // Non-fatal in read-only environments
   }
 }
 
@@ -188,10 +173,10 @@ function loadGatewayCache(): void {
             if (pk?.id && pk?.key) masterProviderKeys.push(pk);
           }
         }
-        if (Array.isArray(parsed.models) && parsed.models.length > 0) {
+        if (Array.isArray(parsed.models)) {
           masterModels.clear();
           for (const m of parsed.models) {
-            if (m?.id) masterModels.set(m.id, m);
+            if (m?.id && m?.ownerKeyId) masterModels.set(m.id, m);
           }
         }
         if (Array.isArray(parsed.logs)) {
@@ -208,25 +193,11 @@ function loadGatewayCache(): void {
       }
     }
   } catch {
-    // Ignore parse errors
-  }
-
-  // Fallback to default showcase models if nothing persisted yet
-  if (masterModels.size === 0) {
-    for (const m of defaultInitialModels) {
-      masterModels.set(m.id, m);
-    }
+    // Ignore cache parse errors
   }
 }
 
 loadGatewayCache();
-
-// Ensure initial showcase models if cache was empty
-if (masterProviderKeys.length === 0 && masterModels.size === 0) {
-  for (const m of defaultInitialModels) {
-    masterModels.set(m.id, m);
-  }
-}
 
 // ==========================================
 // Provider Endpoints & URL Normalization
@@ -335,95 +306,9 @@ export function detectProviderByKey(key: string, customBaseUrl?: string): Suppor
 }
 
 /**
- * Official models fallback when upstream key is demo/test/sandbox
- */
-export function getStandardProviderModels(provider: string): string[] {
-  switch (provider) {
-    case 'inception':
-      return [
-        'mercury-coder-small',
-        'mercury-coder-mini',
-        'mercury-small'
-      ];
-    case 'groq':
-      return [
-        'llama-3.3-70b-versatile',
-        'llama-3.1-8b-instant',
-        'llama-3.2-1b-preview',
-        'llama-3.2-3b-preview',
-        'mixtral-8x7b-32768',
-        'gemma2-9b-it',
-        'deepseek-r1-distill-llama-70b'
-      ];
-    case 'openai':
-      return [
-        'gpt-4o',
-        'gpt-4o-mini',
-        'gpt-4-turbo',
-        'o1',
-        'o1-mini',
-        'o3-mini',
-        'chatgpt-4o-latest'
-      ];
-    case 'gemini':
-      return [
-        'gemini-2.0-flash',
-        'gemini-2.0-flash-lite-preview-02-05',
-        'gemini-1.5-pro',
-        'gemini-1.5-flash',
-        'gemini-1.5-flash-8b'
-      ];
-    case 'openrouter':
-      return [
-        'anthropic/claude-3.5-sonnet',
-        'openai/gpt-4o',
-        'meta-llama/llama-3.3-70b-instruct',
-        'deepseek/deepseek-r1',
-        'google/gemini-2.0-flash-001'
-      ];
-    case 'deepseek':
-      return [
-        'deepseek-chat',
-        'deepseek-reasoner'
-      ];
-    case 'mistral':
-      return [
-        'mistral-large-latest',
-        'mistral-small-latest',
-        'codestral-latest',
-        'pixtral-12b-2409'
-      ];
-    case 'cerebras':
-      return [
-        'llama-3.3-70b',
-        'llama-3.1-8b',
-        'llama-3.1-70b'
-      ];
-    case 'anthropic':
-      return [
-        'claude-3-7-sonnet-20250219',
-        'claude-3-5-sonnet-20241022',
-        'claude-3-5-haiku-20241022'
-      ];
-    default:
-      return ['custom-model-1'];
-  }
-}
-
-/**
- * Rebuild masterModels map strictly from active Admin Pool Keys when keys exist
+ * Rebuild masterModels map strictly from active Admin Pool Keys (100% dynamic, zero fake models)
  */
 export function rebuildMasterModelsFromPool(): void {
-  if (masterProviderKeys.length === 0) {
-    // Keep default catalog only when admin hasn't added any provider keys yet
-    if (masterModels.size === 0) {
-      for (const m of defaultInitialModels) {
-        masterModels.set(m.id, m);
-      }
-    }
-    return;
-  }
-
   const nextModels = new Map<string, StoredModel>();
   const keyCounts = new Map<string, number>();
 
@@ -460,26 +345,16 @@ export function rebuildMasterModelsFromPool(): void {
   saveGatewayCache();
 }
 
-function isTestOrSandboxKey(apiKey: string): boolean {
-  const lower = apiKey.toLowerCase();
-  return (
-    lower.includes('test') ||
-    lower.includes('demo') ||
-    lower.includes('sample') ||
-    lower.includes('sandbox') ||
-    lower.includes('master_pool_key')
-  );
-}
-
 /**
- * Fetch models directly from upstream provider GET /v1/models endpoint
+ * Fetch real live models directly from upstream provider GET /v1/models endpoint
  */
 export async function fetchUpstreamModels(
   provider: string,
   apiKey: string,
   customBaseUrl?: string,
   ownerKeyId?: string,
-  ownerKeyHint?: string
+  ownerKeyHint?: string,
+  mutateCatalog = true
 ): Promise<string[]> {
   const baseUrl = resolveProviderBaseUrl(provider, customBaseUrl);
   const modelsPath = PROVIDER_CONFIGS[provider]?.modelsPath || '/models';
@@ -497,46 +372,39 @@ export async function fetchUpstreamModels(
     headers['Authorization'] = `Bearer ${apiKey}`;
   }
 
+  const response = await fetch(url, {
+    method: 'GET',
+    headers
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => '');
+    throw new Error(`Upstream ${provider} (${url}) returned HTTP ${response.status}: ${errorText.slice(0, 180) || response.statusText}`);
+  }
+
+  const rawText = await response.text();
+  let json: any;
   try {
-    const response = await fetch(url, {
-      method: 'GET',
-      headers
-    });
+    json = JSON.parse(rawText);
+  } catch {
+    throw new Error(`Upstream ${provider} (${url}) returned non-JSON response: ${rawText.slice(0, 140)}`);
+  }
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      if (isTestOrSandboxKey(apiKey)) {
-        const fallback = getStandardProviderModels(provider);
-        for (const modelId of fallback) {
-          masterModels.set(modelId, {
-            id: modelId,
-            name: formatModelDisplayName(modelId),
-            provider,
-            ownerKeyId,
-            ownerKeyHint,
-            discoveredAt: new Date().toISOString()
-          });
-        }
-        return fallback;
-      }
-      throw new Error(`Upstream ${provider} (${url}) returned HTTP ${response.status}: ${errorText.slice(0, 180)}`);
-    }
+  const rawItems: any[] = Array.isArray(json?.data)
+    ? json.data
+    : Array.isArray(json?.models)
+    ? json.models
+    : Array.isArray(json)
+    ? json
+    : [];
 
-    const json: any = await response.json();
-    const rawItems: any[] = Array.isArray(json?.data)
-      ? json.data
-      : Array.isArray(json?.models)
-      ? json.models
-      : Array.isArray(json)
-      ? json
-      : [];
-
-    const models: string[] = [];
-    for (const item of rawItems) {
-      const rawId = typeof item === 'string' ? item : item?.id || item?.name;
-      if (rawId && typeof rawId === 'string') {
-        const cleanId = rawId.replace(/^models\//, '');
-        models.push(cleanId);
+  const models: string[] = [];
+  for (const item of rawItems) {
+    const rawId = typeof item === 'string' ? item : item?.id || item?.name;
+    if (rawId && typeof rawId === 'string') {
+      const cleanId = rawId.replace(/^models\//, '');
+      models.push(cleanId);
+      if (mutateCatalog) {
         masterModels.set(cleanId, {
           id: cleanId,
           name: item?.display_name || item?.name || formatModelDisplayName(cleanId),
@@ -548,25 +416,9 @@ export async function fetchUpstreamModels(
         });
       }
     }
-
-    return models;
-  } catch (err: any) {
-    if (isTestOrSandboxKey(apiKey)) {
-      const fallback = getStandardProviderModels(provider);
-      for (const modelId of fallback) {
-        masterModels.set(modelId, {
-          id: modelId,
-          name: formatModelDisplayName(modelId),
-          provider,
-          ownerKeyId,
-          ownerKeyHint,
-          discoveredAt: new Date().toISOString()
-        });
-      }
-      return fallback;
-    }
-    throw err;
   }
+
+  return models;
 }
 
 // ==========================================
@@ -630,9 +482,8 @@ export async function validateGatewayKey(req: Request, res: Response, next: Next
   next();
 }
 
-// Helper to build strict OpenAI models list response
 function buildOpenAiModelsList() {
-  const createdTs = Math.floor(Date.now() / 1000) - 86400;
+  const createdTs = Math.floor(Date.now() / 1000);
   return {
     object: 'list',
     data: Array.from(masterModels.values()).map(m => ({
@@ -642,6 +493,8 @@ function buildOpenAiModelsList() {
       owned_by: 'freeaimodel',
       provider: m.provider,
       name: m.name || formatModelDisplayName(m.id),
+      ownerKeyId: m.ownerKeyId,
+      ownerKeyHint: m.ownerKeyHint,
       permission: [{
         id: `modelperm-${m.id}`,
         object: 'model_permission',
@@ -663,7 +516,7 @@ function buildOpenAiModelsList() {
 }
 
 // ==========================================
-// Public / Frontend Dashboard Model Catalog Endpoint
+// Public / Frontend Dashboard Model Catalog Endpoint (100% live models only)
 // ==========================================
 gatewayApp.get('/api/models', (req: Request, res: Response) => {
   res.json(buildOpenAiModelsList());
@@ -699,7 +552,7 @@ const handleChatCompletions = async (req: Request, res: Response) => {
     tools,
     tool_choice,
     response_format
-  } = req.body;
+  } = req.body || {};
 
   if (!model) {
     res.status(400).json({
@@ -733,9 +586,6 @@ const handleChatCompletions = async (req: Request, res: Response) => {
   const modelRecord = masterModels.get(model);
   const modelProvider = modelRecord?.provider;
 
-  // Match keys that own or support this requested model:
-  // 1. Explicit supportedModels match OR ownerKeyId match
-  // 2. Fallback to same provider as modelRecord (if modelRecord exists)
   let candidateKeys = availableKeys.filter(k => {
     const ownsModel = (Array.isArray(k.supportedModels) && k.supportedModels.includes(model)) ||
       (modelRecord?.ownerKeyId && k.id === modelRecord.ownerKeyId);
@@ -743,7 +593,6 @@ const handleChatCompletions = async (req: Request, res: Response) => {
     return ownsModel || sameProvider;
   });
 
-  // Sort: exact model ownership first, then lowest error count
   candidateKeys.sort((a, b) => {
     const aOwns = (a.supportedModels?.includes(model) || a.id === modelRecord?.ownerKeyId) ? 1 : 0;
     const bOwns = (b.supportedModels?.includes(model) || b.id === modelRecord?.ownerKeyId) ? 1 : 0;
@@ -841,7 +690,6 @@ const handleChatCompletions = async (req: Request, res: Response) => {
         continue;
       }
 
-      // Streaming SSE
       if (stream) {
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
@@ -866,12 +714,10 @@ const handleChatCompletions = async (req: Request, res: Response) => {
         }
       }
 
-      // Non-streaming JSON
       let data: any = await upstreamResponse.json();
       providerUsed = providerKey.provider;
       providerKey.status = 'active';
 
-      // Normalize Anthropic response into OpenAI format
       if (isAnthropic && data.content) {
         const text = Array.isArray(data.content)
           ? data.content.map((c: any) => c.text || '').join('')
@@ -922,69 +768,10 @@ const handleChatCompletions = async (req: Request, res: Response) => {
     }
   }
 
-  // Fallback only if no provider keys are configured in Admin Pool yet
-  if (!success && masterProviderKeys.length === 0) {
-    const envGeminiKey = process.env.GEMINI_API_KEY;
-    if (envGeminiKey && envGeminiKey !== 'MY_GEMINI_API_KEY') {
-      try {
-        const geminiEndpoint = `${PROVIDER_CONFIGS.gemini.baseUrl}${PROVIDER_CONFIGS.gemini.chatPath}`;
-        const geminiModel = model.includes('gemini') ? model : 'gemini-2.0-flash';
-        const geminiRes = await fetch(geminiEndpoint, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${envGeminiKey}`
-          },
-          body: JSON.stringify({
-            model: geminiModel,
-            messages,
-            temperature: temperature ?? 0.7,
-            max_tokens: max_tokens ?? 2048,
-            stream: Boolean(stream)
-          })
-        });
-
-        if (geminiRes.ok) {
-          if (stream && geminiRes.body) {
-            res.setHeader('Content-Type', 'text/event-stream');
-            res.setHeader('Cache-Control', 'no-cache');
-            res.setHeader('Connection', 'keep-alive');
-            res.setHeader('x-gateway-provider', 'gemini-fallback');
-            const reader = geminiRes.body.getReader();
-            const decoder = new TextDecoder();
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              res.write(decoder.decode(value, { stream: true }));
-            }
-            res.end();
-            success = true;
-            providerUsed = 'gemini-fallback';
-          } else {
-            const data = await geminiRes.json();
-            providerUsed = 'gemini-fallback';
-            const content = data.choices?.[0]?.message?.content || '';
-            completionTokens = Math.max(15, Math.round(content.length / 4));
-            data.gateway_meta = {
-              provider_used: 'gemini-fallback',
-              failover_count: failoverCount,
-              latency_ms: Date.now() - startTime,
-              cost_usd: 0
-            };
-            res.json(data);
-            success = true;
-          }
-        }
-      } catch {
-        // Ignore fallback failure
-      }
-    }
-  }
-
   if (!success) {
     const statusToSend = candidateKeys.length === 0 ? 404 : (lastErrorStatus >= 400 ? lastErrorStatus : 502);
     const errorMessage = candidateKeys.length === 0
-      ? `No active Admin Pool provider key owns model "${model}". Add a provider key that supports "${model}" in the Admin Panel.`
+      ? `No active Admin Pool provider key owns model "${model}". Add a valid provider API key in the Admin Panel (/admin) first.`
       : `Upstream request for "${model}" failed after ${failoverCount} attempt(s): ${lastErrorMsg.slice(0, 220)}`;
 
     res.status(statusToSend).json({
@@ -998,7 +785,6 @@ const handleChatCompletions = async (req: Request, res: Response) => {
     return;
   }
 
-  // Record request telemetry
   const totalTokens = promptTokens + completionTokens;
   const cost = (promptTokens * 0.000002) + (completionTokens * 0.000006);
 
@@ -1024,7 +810,6 @@ const handleChatCompletions = async (req: Request, res: Response) => {
 
   if (masterLogs.length > 500) masterLogs.length = 500;
 
-  // Deduct daily credits for user account (with automatic daily reset)
   const userAccount = masterUsers.get(apiKeyRecord.userId);
   if (userAccount) {
     ensureDailyCreditsReset(userAccount);
@@ -1123,7 +908,7 @@ gatewayApp.get('/api/user/credits', (req: Request, res: Response) => {
 });
 
 // ==========================================
-// Admin APIs: Key Pool & Dynamic Model Discovery
+// Admin APIs: Key Pool & Live Model Discovery
 // ==========================================
 function checkOptionalAdminHeader(req: Request, res: Response, next: NextFunction): void {
   const userEmailHeader = req.headers['x-user-email'];
@@ -1140,7 +925,7 @@ function checkOptionalAdminHeader(req: Request, res: Response, next: NextFunctio
 
 const handleBulkAddKeys = async (req: Request, res: Response) => {
   try {
-    const { keysText, provider, customBaseUrl } = req.body;
+    const { keysText, provider, customBaseUrl } = req.body || {};
     if (!keysText || typeof keysText !== 'string') {
       res.status(400).json({ error: 'keysText is required as a string.' });
       return;
@@ -1148,8 +933,8 @@ const handleBulkAddKeys = async (req: Request, res: Response) => {
 
     const lines = keysText
       .split(/[\r\n,]+/)
-      .map(line => line.trim())
-      .filter(line => line.length > 5 && !line.startsWith('#'));
+      .map((line: string) => line.trim())
+      .filter((line: string) => line.length > 5 && !line.startsWith('#'));
 
     if (lines.length === 0) {
       res.status(400).json({ error: 'No valid keys detected in input.' });
@@ -1159,6 +944,7 @@ const handleBulkAddKeys = async (req: Request, res: Response) => {
     const normalizedCustomUrl = normalizeBaseUrl(customBaseUrl);
     const addedKeys: StoredProviderKey[] = [];
     const discoveredModelsSummary: Record<string, string[]> = {};
+    const discoveryErrors: Record<string, string> = {};
 
     for (const rawKey of lines) {
       const targetProvider: SupportedProvider =
@@ -1183,14 +969,16 @@ const handleBulkAddKeys = async (req: Request, res: Response) => {
         updatedAt: new Date().toISOString()
       };
 
-      // Auto-fetch models from provider's /models endpoint using this key
       try {
         const models = await fetchUpstreamModels(targetProvider, rawKey, normalizedCustomUrl, keyId, hint);
         newKeyRecord.supportedModels = models;
         discoveredModelsSummary[hint] = models;
       } catch (err: any) {
-        console.warn(`[FreeAIModel] Model fetch for ${hint} failed:`, err.message);
-        newKeyRecord.lastError = `Model fetch: ${err.message}`;
+        const errMsg = err?.message || 'Failed to query upstream /models endpoint';
+        console.warn(`[FreeAIModel] Model fetch for ${hint} failed:`, errMsg);
+        newKeyRecord.lastError = errMsg;
+        newKeyRecord.errorCount = 1;
+        discoveryErrors[hint] = errMsg;
       }
 
       masterProviderKeys.push(newKeyRecord);
@@ -1200,9 +988,9 @@ const handleBulkAddKeys = async (req: Request, res: Response) => {
     rebuildMasterModelsFromPool();
     saveGatewayCache();
 
-    res.json({
+    res.status(200).json({
       success: true,
-      message: `Successfully added ${addedKeys.length} key(s) to Master Key Pool.`,
+      message: `Added ${addedKeys.length} key(s) to Master Key Pool.`,
       addedCount: addedKeys.length,
       keys: addedKeys.map(k => ({
         id: k.id,
@@ -1218,26 +1006,25 @@ const handleBulkAddKeys = async (req: Request, res: Response) => {
         updatedAt: k.updatedAt
       })),
       discoveredModelsSummary,
+      discoveryErrors,
       models: Array.from(masterModels.values()),
       totalKeysInPool: masterProviderKeys.length
     });
   } catch (error: any) {
-    res.status(500).json({ error: error.message || 'Internal server error' });
+    res.status(500).json({ error: error?.message || 'Internal server error during key ingestion' });
   }
 };
 
 gatewayApp.post('/api/admin/bulk-add-keys', checkOptionalAdminHeader, handleBulkAddKeys);
-gatewayApp.post('/api/models/add-keys', handleBulkAddKeys);
+gatewayApp.post('/api/models/add-keys', checkOptionalAdminHeader, handleBulkAddKeys);
 
-// Get current admin pool keys
 gatewayApp.get('/api/admin/keys', checkOptionalAdminHeader, (req: Request, res: Response) => {
   res.json({ keys: masterProviderKeys });
 });
 
-// Toggle admin key status
 gatewayApp.patch('/api/admin/keys/:id/status', checkOptionalAdminHeader, (req: Request, res: Response) => {
   const { id } = req.params;
-  const { status } = req.body;
+  const { status } = req.body || {};
   const target = masterProviderKeys.find(k => k.id === id);
   if (!target) {
     res.status(404).json({ error: 'Provider key not found' });
@@ -1251,7 +1038,6 @@ gatewayApp.patch('/api/admin/keys/:id/status', checkOptionalAdminHeader, (req: R
   res.json({ success: true, key: target, models: Array.from(masterModels.values()) });
 });
 
-// Delete admin key
 gatewayApp.delete('/api/admin/keys/:id', checkOptionalAdminHeader, (req: Request, res: Response) => {
   const { id } = req.params;
   const idx = masterProviderKeys.findIndex(k => k.id === id);
@@ -1263,7 +1049,6 @@ gatewayApp.delete('/api/admin/keys/:id', checkOptionalAdminHeader, (req: Request
   res.json({ success: true, models: Array.from(masterModels.values()), totalKeysInPool: masterProviderKeys.length });
 });
 
-// Refresh models across all active provider keys
 gatewayApp.post('/api/models/refresh', async (req: Request, res: Response) => {
   const results: Record<string, { status: string; count: number; error?: string }> = {};
   let totalDiscovered = 0;
@@ -1280,7 +1065,7 @@ gatewayApp.post('/api/models/refresh', async (req: Request, res: Response) => {
       results[pKey.keyHint] = { status: 'success', count: models.length };
       totalDiscovered += models.length;
     } catch (err: any) {
-      results[pKey.keyHint] = { status: 'failed', count: 0, error: err.message };
+      results[pKey.keyHint] = { status: 'failed', count: 0, error: err?.message || 'Upstream fetch failed' };
     }
   }
 
@@ -1296,9 +1081,8 @@ gatewayApp.post('/api/models/refresh', async (req: Request, res: Response) => {
   });
 });
 
-// Test single provider key
-gatewayApp.post('/api/admin/test-key', async (req: Request, res: Response) => {
-  const { provider, key, customBaseUrl } = req.body;
+gatewayApp.post('/api/admin/test-key', checkOptionalAdminHeader, async (req: Request, res: Response) => {
+  const { provider, key, customBaseUrl } = req.body || {};
   if (!key) {
     res.status(400).json({ error: 'Key is required' });
     return;
@@ -1307,7 +1091,7 @@ gatewayApp.post('/api/admin/test-key', async (req: Request, res: Response) => {
   const start = Date.now();
 
   try {
-    const models = await fetchUpstreamModels(targetProvider, key, customBaseUrl);
+    const models = await fetchUpstreamModels(targetProvider, key, customBaseUrl, undefined, undefined, false);
     res.json({
       success: true,
       provider: targetProvider,
@@ -1320,14 +1104,13 @@ gatewayApp.post('/api/admin/test-key', async (req: Request, res: Response) => {
       success: false,
       provider: targetProvider,
       latencyMs: Date.now() - start,
-      error: err.message
+      error: err?.message || 'Failed to reach upstream provider'
     });
   }
 });
 
-// Synchronize keys and models between Firestore / UI and backend gateway memory
 gatewayApp.post('/api/gateway/sync', (req: Request, res: Response) => {
-  const { apiKeys, providerKeys, models, replaceProviderKeys } = req.body;
+  const { apiKeys, providerKeys, models, replaceProviderKeys } = req.body || {};
 
   if (Array.isArray(apiKeys)) {
     for (const k of apiKeys) {
@@ -1353,19 +1136,23 @@ gatewayApp.post('/api/gateway/sync', (req: Request, res: Response) => {
     rebuildMasterModelsFromPool();
   }
 
-  if (Array.isArray(models) && models.length > 0 && masterProviderKeys.length === 0) {
-    for (const m of models) {
-      if (m && m.id) {
-        masterModels.set(m.id, {
-          id: m.id,
-          name: m.name || formatModelDisplayName(m.id),
-          provider: m.provider || 'freeaimodel',
-          ownerKeyId: m.ownerKeyId,
-          ownerKeyHint: m.ownerKeyHint,
-          discoveredAt: m.discoveredAt || new Date().toISOString(),
-          contextWindow: m.contextWindow,
-          description: m.description
-        });
+  // Only hydrate live-discovered models from Firestore (must carry ownerKeyId from a real admin key)
+  if (Array.isArray(models) && masterProviderKeys.length === 0) {
+    masterModels.clear();
+    if (!replaceProviderKeys) {
+      for (const m of models) {
+        if (m && m.id && m.ownerKeyId) {
+          masterModels.set(m.id, {
+            id: m.id,
+            name: m.name || formatModelDisplayName(m.id),
+            provider: m.provider || 'custom',
+            ownerKeyId: m.ownerKeyId,
+            ownerKeyHint: m.ownerKeyHint,
+            discoveredAt: m.discoveredAt || new Date().toISOString(),
+            contextWindow: m.contextWindow,
+            description: m.description
+          });
+        }
       }
     }
   }
@@ -1381,7 +1168,6 @@ gatewayApp.post('/api/gateway/sync', (req: Request, res: Response) => {
   });
 });
 
-// Fetch system health and stats
 gatewayApp.get('/api/stats', (req: Request, res: Response) => {
   const totalRequests = masterLogs.length;
   const totalTokens = masterLogs.reduce((acc, log) => acc + (log.totalTokens || 0), 0);
@@ -1398,5 +1184,20 @@ gatewayApp.get('/api/stats', (req: Request, res: Response) => {
     totalProviderKeys: masterProviderKeys.length,
     totalModels: masterModels.size,
     logs: masterLogs.slice(0, 50)
+  });
+});
+
+// ==========================================
+// Strict JSON 404 & Global Error Middleware (Prevents HTML/plain-text responses on /api/* & /v1/*)
+// ==========================================
+gatewayApp.use(['/api', '/v1'], (req: Request, res: Response) => {
+  res.status(404).json({ error: `Gateway endpoint not found: ${req.method} ${req.originalUrl}` });
+});
+
+gatewayApp.use((err: any, req: Request, res: Response, _next: NextFunction) => {
+  console.error('[FreeAIModel Gateway Error]', err);
+  if (res.headersSent) return;
+  res.status(err?.status || 500).json({
+    error: err?.message || 'Internal gateway server error'
   });
 });

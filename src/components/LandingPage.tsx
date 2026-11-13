@@ -39,7 +39,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   // Canonical FreeAIModel Gateway URL
   const serverOrigin = 'https://freeaimodel.vercel.app';
   const baseUrl = `${serverOrigin}/v1`;
-  const dynamicModel = models[0]?.id || 'llama-3.3-70b-versatile';
+  const dynamicModel = models[0]?.id || 'YOUR_ACTIVE_MODEL_ID';
 
   const curlSnippet = `curl -X POST ${baseUrl}/chat/completions \\
   -H "Authorization: Bearer YOUR_GENERATED_API_KEY" \\
@@ -58,16 +58,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
     setTimeout(() => setCopiedBaseUrl(false), 2000);
   };
 
-  const showcaseModels = models.length > 0 ? models.slice(0, 8) : [
-    { id: 'llama-3.3-70b-versatile', name: 'Llama 3.3 70B Versatile', provider: 'groq' },
-    { id: 'gpt-4o', name: 'GPT-4o Omnimodel', provider: 'openai' },
-    { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash', provider: 'gemini' },
-    { id: 'deepseek-chat', name: 'DeepSeek-V3 Chat', provider: 'deepseek' },
-    { id: 'deepseek-reasoner', name: 'DeepSeek-R1 Reasoner', provider: 'deepseek' },
-    { id: 'mistral-large-latest', name: 'Mistral Large 2', provider: 'mistral' },
-    { id: 'mercury-coder-small', name: 'Mercury Coder Small', provider: 'inception' },
-    { id: 'gpt-4o-mini', name: 'GPT-4o Mini', provider: 'openai' }
-  ];
+  const showcaseModels = models.slice(0, 8);
 
   return (
     <div className="min-h-screen bg-[#FAF9F6] text-zinc-900 selection:bg-violet-500 selection:text-white antialiased">
@@ -135,7 +126,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
 
           {/* Subtitle */}
           <p className="max-w-2xl mx-auto text-base sm:text-lg text-zinc-600 font-normal leading-relaxed mb-8">
-            Route requests to Llama 3.3, GPT-4o, Gemini 2.0, DeepSeek R1, Mistral, and Claude via one unified OpenAI-compatible endpoint. Automatic 429 rotation across multi-key pools.
+            Route requests across all connected AI provider keys via one unified OpenAI-compatible endpoint. 100% live model discovery and automatic 429 rotation across multi-key pools.
           </p>
 
           {/* Hero CTAs */}
@@ -316,56 +307,68 @@ export const LandingPage: React.FC<LandingPageProps> = ({
           </p>
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-          {showcaseModels.map((m) => (
-            <div
-              key={m.id}
-              className="bg-white rounded-xl border border-zinc-200/80 p-4 shadow-xs hover:border-violet-300 hover:shadow-sm transition-all flex flex-col justify-between group"
-            >
-              <div>
-                <div className="flex items-start justify-between gap-2 mb-3">
-                  <div className="flex items-center gap-2 min-w-0">
-                    <div className="w-8 h-8 rounded-lg bg-zinc-50 border border-zinc-200/80 flex items-center justify-center shrink-0">
-                      <ProviderLogo provider={m.provider} size={18} />
+        {showcaseModels.length === 0 ? (
+          <div className="bg-white rounded-2xl border border-dashed border-zinc-300 p-12 text-center max-w-2xl mx-auto">
+            <div className="w-12 h-12 rounded-xl bg-zinc-100 text-zinc-500 flex items-center justify-center mx-auto mb-3">
+              <Layers className="w-6 h-6" />
+            </div>
+            <h3 className="text-base font-semibold text-zinc-900">No Live Models Synced Yet</h3>
+            <p className="text-xs text-zinc-500 mt-1 max-w-md mx-auto">
+              Live models appear here automatically as soon as upstream provider API keys are connected in the Admin Dashboard.
+            </p>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            {showcaseModels.map((m) => (
+              <div
+                key={m.id}
+                className="bg-white rounded-xl border border-zinc-200/80 p-4 shadow-xs hover:border-violet-300 hover:shadow-sm transition-all flex flex-col justify-between group"
+              >
+                <div>
+                  <div className="flex items-start justify-between gap-2 mb-3">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <div className="w-8 h-8 rounded-lg bg-zinc-50 border border-zinc-200/80 flex items-center justify-center shrink-0">
+                        <ProviderLogo provider={m.provider} size={18} />
+                      </div>
+                      <span className="font-semibold text-sm text-zinc-900 group-hover:text-violet-700 transition-colors truncate">
+                        {m.name || m.id}
+                      </span>
                     </div>
-                    <span className="font-semibold text-sm text-zinc-900 group-hover:text-violet-700 transition-colors truncate">
-                      {m.name || m.id}
+
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold tracking-wider uppercase bg-emerald-50 text-emerald-700 border border-emerald-300/80 shrink-0">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                      FREE
                     </span>
                   </div>
 
-                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold tracking-wider uppercase bg-emerald-50 text-emerald-700 border border-emerald-300/80 shrink-0">
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                    FREE
+                  <div className="bg-zinc-50 px-2.5 py-1.5 rounded-lg border border-zinc-100 text-[11px] font-mono text-zinc-600 truncate">
+                    {m.id}
+                  </div>
+                </div>
+
+                <div className="mt-3 pt-2.5 border-t border-zinc-100 flex items-center justify-between text-xs">
+                  <span className="text-[10px] font-bold uppercase text-zinc-400">
+                    {m.provider}
                   </span>
-                </div>
-
-                <div className="bg-zinc-50 px-2.5 py-1.5 rounded-lg border border-zinc-100 text-[11px] font-mono text-zinc-600 truncate">
-                  {m.id}
+                  <button
+                    onClick={onOpenPlayground}
+                    className="text-violet-600 hover:text-violet-800 font-medium text-[11px] flex items-center gap-0.5 cursor-pointer"
+                  >
+                    <span>Test Free</span>
+                    <ChevronRight className="w-3 h-3" />
+                  </button>
                 </div>
               </div>
-
-              <div className="mt-3 pt-2.5 border-t border-zinc-100 flex items-center justify-between text-xs">
-                <span className="text-[10px] font-bold uppercase text-zinc-400">
-                  {m.provider}
-                </span>
-                <button
-                  onClick={onOpenPlayground}
-                  className="text-violet-600 hover:text-violet-800 font-medium text-[11px] flex items-center gap-0.5 cursor-pointer"
-                >
-                  <span>Test Free</span>
-                  <ChevronRight className="w-3 h-3" />
-                </button>
-              </div>
-            </div>
-          ))}
-        </div>
+            ))}
+          </div>
+        )}
 
         <div className="text-center mt-10">
           <button
             onClick={onViewModels}
             className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-zinc-900 hover:bg-zinc-800 text-white text-xs font-semibold shadow-xs transition-colors cursor-pointer"
           >
-            <span>View All Models ({models.length || 15}+)</span>
+            <span>View All Models ({models.length})</span>
             <ArrowRight className="w-3.5 h-3.5" />
           </button>
         </div>

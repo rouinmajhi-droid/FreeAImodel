@@ -18,6 +18,7 @@ import { ProviderLogo } from './ProviderLogo';
 interface ModelsViewProps {
   models: GatewayModel[];
   providerKeys: ProviderKey[];
+  isAdmin?: boolean;
   onSelectModelForPlayground: (modelId: string) => void;
   onAddKeyAndFetchModels: (keysText: string, provider: string, customBaseUrl?: string) => Promise<{ addedCount: number; modelsCount: number }>;
   onRefreshModels: () => Promise<void>;
@@ -27,6 +28,7 @@ interface ModelsViewProps {
 export const ModelsView: React.FC<ModelsViewProps> = ({
   models,
   providerKeys = [],
+  isAdmin = false,
   onSelectModelForPlayground,
   onAddKeyAndFetchModels,
   onRefreshModels,
@@ -142,18 +144,20 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
             <span>{isRefreshing ? 'Syncing...' : 'Sync Models'}</span>
           </button>
 
-          <button
-            onClick={() => setIsAddModalOpen(true)}
-            className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-violet-600 hover:bg-violet-700 rounded-lg shadow-sm transition-colors cursor-pointer"
-          >
-            <Plus className="w-4 h-4" />
-            <span>Add Provider Key</span>
-          </button>
+          {isAdmin && (
+            <button
+              onClick={() => setIsAddModalOpen(true)}
+              className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-violet-600 hover:bg-violet-700 rounded-lg shadow-sm transition-colors cursor-pointer"
+            >
+              <Plus className="w-4 h-4" />
+              <span>Add Provider Key</span>
+            </button>
+          )}
         </div>
       </div>
 
-      {/* 2. Connected Key Sources (Compact pill bar) */}
-      {providerKeys.length > 0 && (
+      {/* 2. Connected Key Sources (Admin Only) */}
+      {isAdmin && providerKeys.length > 0 && (
         <div className="bg-white border border-zinc-200/80 rounded-xl px-4 py-3 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div className="flex items-center gap-2 flex-wrap">
             <span className="text-xs font-semibold text-zinc-500 uppercase tracking-wider flex items-center gap-1.5">
@@ -218,7 +222,7 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
           <Search className="w-4 h-4 text-zinc-400 absolute left-3 top-1/2 -translate-y-1/2" />
           <input
             type="text"
-            placeholder="Search models by name or ID (e.g. llama-3.3, gpt-4o, gemini-2.0)..."
+            placeholder="Search live discovered models by name or ID..."
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             className="w-full pl-9 pr-4 py-2 text-xs rounded-lg border border-zinc-200 focus:border-violet-600 outline-none"
@@ -256,20 +260,26 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
           <div className="w-12 h-12 rounded-xl bg-violet-50 text-violet-600 flex items-center justify-center mx-auto mb-3">
             <Layers className="w-6 h-6" />
           </div>
-          <h3 className="text-base font-semibold text-zinc-900">No models found</h3>
+          <h3 className="text-base font-semibold text-zinc-900">
+            {models.length === 0 ? 'No Live Models Discovered Yet' : 'No Matching Models Found'}
+          </h3>
           <p className="text-xs text-zinc-500 max-w-md mx-auto mt-1 mb-4">
-            Try adjusting your search criteria or add new provider keys.
+            {models.length === 0
+              ? 'Models appear here automatically as soon as valid upstream provider API keys are synced in the Admin Dashboard.'
+              : 'Try clearing your search query or provider filter.'}
           </p>
-          <button
-            onClick={() => {
-              setSearch('');
-              setProviderFilter('all');
-              setSelectedKeyFilter(null);
-            }}
-            className="px-4 py-2 text-xs font-semibold text-zinc-700 bg-zinc-100 hover:bg-zinc-200 rounded-lg transition-colors cursor-pointer"
-          >
-            Reset Filters
-          </button>
+          {models.length > 0 && (
+            <button
+              onClick={() => {
+                setSearch('');
+                setProviderFilter('all');
+                setSelectedKeyFilter(null);
+              }}
+              className="px-4 py-2 text-xs font-semibold text-zinc-700 bg-zinc-100 hover:bg-zinc-200 rounded-lg transition-colors cursor-pointer"
+            >
+              Reset Filters
+            </button>
+          )}
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">

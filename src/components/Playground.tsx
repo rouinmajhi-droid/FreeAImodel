@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import { ApiKey, GatewayModel } from '../types/gateway';
 import { useToast } from './Toast';
+import { parseJsonSafe } from '../lib/http';
 
 interface PlaygroundProps {
   apiKeys: ApiKey[];
@@ -26,7 +27,7 @@ export const Playground: React.FC<PlaygroundProps> = ({
 }) => {
   const { showToast } = useToast();
   const [selectedApiKey, setSelectedApiKey] = useState(initialSelectedKey || apiKeys[0]?.key || '');
-  const [selectedModel, setSelectedModel] = useState(models[0]?.id || 'llama-3.3-70b-versatile');
+  const [selectedModel, setSelectedModel] = useState(models[0]?.id || '');
   const [systemPrompt, setSystemPrompt] = useState('You are a helpful, senior technical AI assistant.');
   const [userPrompt, setUserPrompt] = useState('Explain how an API Gateway with multi-provider 429 rotation ensures 99.99% uptime.');
   const [temperature, setTemperature] = useState(0.7);
@@ -56,14 +57,20 @@ export const Playground: React.FC<PlaygroundProps> = ({
   }, [initialSelectedKey, apiKeys]);
 
   useEffect(() => {
-    if (!selectedModel && models.length > 0) {
+    if (models.length === 0) {
+      setSelectedModel('');
+    } else if (!selectedModel || !models.some(m => m.id === selectedModel)) {
       setSelectedModel(models[0].id);
     }
-  }, [models]);
+  }, [models, selectedModel]);
 
   const handleSend = async () => {
     if (!selectedApiKey) {
       showToast('Key Required', 'Please select or generate a Gateway API key first.', 'error');
+      return;
+    }
+    if (!selectedModel) {
+      showToast('Model Unavailable', 'No live models discovered yet. Connect a valid provider API key in Admin first.', 'error');
       return;
     }
     if (!userPrompt.trim()) {
@@ -102,8 +109,7 @@ export const Playground: React.FC<PlaygroundProps> = ({
       });
 
       if (!response.ok) {
-        const errJson = await response.json().catch(() => ({ error: { message: response.statusText } }));
-        throw new Error(errJson.error?.message || `Gateway returned HTTP ${response.status}`);
+        await parseJsonSafe(response);
       }
 
       const providerHeader = response.headers.get('x-gateway-provider') || 'auto-resolved';
@@ -154,7 +160,7 @@ export const Playground: React.FC<PlaygroundProps> = ({
         });
       } else {
         // Non-streaming response
-        const data = await response.json();
+        const data = await parseJsonSafe(response);
         const content = data.choices?.[0]?.message?.content || '';
         setResponseText(content);
         setRawResponse(data);
@@ -243,13 +249,18 @@ export const Playground: React.FC<PlaygroundProps> = ({
               <select
                 value={selectedModel}
                 onChange={(e) => setSelectedModel(e.target.value)}
-                className="w-full px-3 py-2 rounded-lg border border-zinc-200 text-xs font-medium bg-white focus:border-violet-600 outline-none text-zinc-800"
+                disabled={models.length === 0}
+                className="w-full px-3 py-2 rounded-lg border border-zinc-200 text-xs font-medium bg-white focus:border-violet-600 outline-none text-zinc-800 disabled:bg-zinc-50 disabled:text-zinc-400"
               >
-                {models.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.name || m.id} ({m.provider})
-                  </option>
-                ))}
+                {models.length === 0 ? (
+                  <option value="">No live models discovered yet (Admin must add provider keys)</option>
+                ) : (
+                  models.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.name || m.id} ({m.provider})
+                    </option>
+                  ))
+                )}
               </select>
             </div>
 
@@ -316,7 +327,7 @@ export const Playground: React.FC<PlaygroundProps> = ({
             {/* Run Button */}
             <button
               onClick={handleSend}
-              disabled={isLoading || !selectedApiKey}
+              disabled={isLoading || !selectedApiKey || !selectedModel}
               className="w-full inline-flex items-center justify-center gap-2 py-2.5 rounded-lg bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white font-medium text-xs shadow-xs transition-colors cursor-pointer"
             >
               {isLoading ? (

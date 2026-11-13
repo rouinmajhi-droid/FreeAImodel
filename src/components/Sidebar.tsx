@@ -38,7 +38,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
     { id: 'keys', label: 'API Keys', icon: Key },
     { id: 'playground', label: 'Playground', icon: Terminal },
     { id: 'models', label: 'Models', icon: Layers },
-    ...(isAdmin ? [{ id: 'admin' as NavTab, label: 'Admin Panel', icon: ShieldCheck, badge: 'Staff' }] : []),
     { id: 'settings', label: 'Settings', icon: Settings },
   ];
 
@@ -104,7 +103,19 @@ export const Sidebar: React.FC<SidebarProps> = ({
       </div>
 
       {/* 3. Bottom User Profile & Sign Out */}
-      <div className="p-4 border-t border-zinc-100">
+      <div className="p-4 border-t border-zinc-100 space-y-2.5">
+        {isAdmin && (
+          <button
+            onClick={() => onSelectTab('admin')}
+            className="w-full flex items-center justify-between px-3 py-2 rounded-xl bg-zinc-900 hover:bg-zinc-800 text-white text-xs font-semibold shadow-xs transition-colors cursor-pointer"
+          >
+            <span className="flex items-center gap-2">
+              <ShieldCheck className="w-3.5 h-3.5 text-violet-400" />
+              <span>Admin Console</span>
+            </span>
+            <span className="text-[10px] font-mono text-zinc-400">/admin</span>
+          </button>
+        )}
         <div className="flex items-center justify-between p-2 rounded-xl bg-zinc-50 border border-zinc-200/60">
           <div className="flex items-center gap-2.5 min-w-0">
             {user?.photoURL ? (

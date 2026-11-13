@@ -1,20 +1,23 @@
 import React, { useState } from 'react';
 import { Terminal, Copy, Check, Code2, Globe, FileCode, CheckCircle2, ChevronRight } from 'lucide-react';
 import { useToast } from './Toast';
+import { GatewayModel } from '../types/gateway';
 
 interface EndpointsDocsProps {
   userApiKey?: string;
+  models?: GatewayModel[];
 }
 
-export const EndpointsDocs: React.FC<EndpointsDocsProps> = ({ userApiKey }) => {
+export const EndpointsDocs: React.FC<EndpointsDocsProps> = ({ userApiKey, models = [] }) => {
   const { showToast } = useToast();
   const [activeTab, setActiveTab] = useState<'curl' | 'python' | 'node' | 'langchain'>('curl');
   const [copiedSection, setCopiedSection] = useState<string | null>(null);
 
-  const currentOrigin = typeof window !== 'undefined' ? window.location.origin : 'https://api.yourdomain.com';
+  const currentOrigin = typeof window !== 'undefined' ? window.location.origin : 'https://freeaimodel.vercel.app';
   const chatEndpoint = `${currentOrigin}/v1/chat/completions`;
   const modelsEndpoint = `${currentOrigin}/v1/models`;
   const keyPlaceholder = userApiKey || 'sk-gateway-your_api_key_here';
+  const dynamicModel = models[0]?.id || 'YOUR_ACTIVE_MODEL_ID';
 
   const handleCopy = (id: string, text: string) => {
     navigator.clipboard.writeText(text);
@@ -27,7 +30,7 @@ export const EndpointsDocs: React.FC<EndpointsDocsProps> = ({ userApiKey }) => {
   -H "Content-Type: application/json" \\
   -H "Authorization: Bearer ${keyPlaceholder}" \\
   -d '{
-    "model": "llama-3.3-70b-versatile",
+    "model": "${dynamicModel}",
     "messages": [
       {
         "role": "user",
@@ -48,7 +51,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="llama-3.3-70b-versatile", # or "gpt-4o", "gemini-2.0-flash"
+    model="${dynamicModel}",
     messages=[
         {"role": "system", "content": "You are a helpful AI assistant."},
         {"role": "user", "content": "Explain quantum computing in two sentences."}
@@ -69,7 +72,7 @@ const client = new OpenAI({
 
 async function main() {
   const stream = await client.chat.completions.create({
-    model: 'llama-3.3-70b-versatile',
+    model: '${dynamicModel}',
     messages: [{ role: 'user', content: 'Explain quantum computing in two sentences.' }],
     stream: true,
   });
@@ -86,7 +89,7 @@ main();`;
 llm = ChatOpenAI(
     base_url="${currentOrigin}/v1",
     api_key="${keyPlaceholder}",
-    model="llama-3.3-70b-versatile",
+    model="${dynamicModel}",
     temperature=0.7
 )
 
