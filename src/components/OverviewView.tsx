@@ -42,10 +42,10 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
   const { showToast } = useToast();
   const [copiedUrl, setCopiedUrl] = React.useState<string | null>(null);
 
-  // Default to live running server origin so developers can test directly
-  const [useLiveUrl, setUseLiveUrl] = React.useState(true);
-  const liveOrigin = typeof window !== 'undefined' ? window.location.origin : 'https://freeaimodel.org';
-  const customDomain = 'https://freeaimodel.org';
+  // Default to canonical FreeAIModel Gateway URL
+  const [useLiveUrl] = React.useState(false);
+  const liveOrigin = typeof window !== 'undefined' ? window.location.origin : 'https://freeaimodel.vercel.app';
+  const customDomain = 'https://freeaimodel.vercel.app';
   const baseUrl = useLiveUrl ? liveOrigin : customDomain;
 
   const chatUrl = `${baseUrl}/v1/chat/completions`;

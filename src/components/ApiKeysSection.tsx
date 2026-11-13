@@ -44,8 +44,8 @@ export const ApiKeysSection: React.FC<ApiKeysSectionProps> = ({
   // Snippet Tab
   const [activeSnippetTab, setActiveSnippetTab] = useState<'curl' | 'python' | 'node'>('curl');
   const [copiedSnippet, setCopiedSnippet] = useState(false);
-  // Live server origin default
-  const [useLiveUrl, setUseLiveUrl] = useState(true);
+  // Canonical gateway URL default (toggleable to current origin)
+  const [useLiveUrl, setUseLiveUrl] = useState(false);
 
   const toggleMask = (id: string) => {
     setUnmaskedKeys((prev) => ({ ...prev, [id]: !prev[id] }));
@@ -85,27 +85,22 @@ export const ApiKeysSection: React.FC<ApiKeysSectionProps> = ({
     }
   };
 
-  // Real live server URL is the default so copied cURL and SDK commands work immediately with your server
+  // Canonical FreeAIModel Gateway URL default
   const liveOrigin = typeof window !== 'undefined' && window.location.origin
     ? window.location.origin
-    : 'https://ais-dev-v74yl6dga5jcxwtppiqoqk-861257782865.asia-southeast1.run.app';
-  const customDomain = 'https://freeaimodel.org';
+    : 'https://freeaimodel.vercel.app';
+  const customDomain = 'https://freeaimodel.vercel.app';
   const baseUrl = useLiveUrl ? liveOrigin : customDomain;
 
-  // Seamlessly populate the user's active API key
+  // Seamlessly populate the user's active API key and dynamic admin model
   const activeKeyToken = justCreatedKey?.key || apiKeys[0]?.key || 'sk-gateway-live-your_token_here';
+  const defaultDynamicModel = models[0]?.id || 'llama-3.3-70b-versatile';
 
   const snippets = {
-    curl: `curl -X POST "${baseUrl}/v1/chat/completions" \\
-  -H "Content-Type: application/json" \\
+    curl: `curl -X POST ${baseUrl}/v1/chat/completions \\
   -H "Authorization: Bearer ${activeKeyToken}" \\
-  -d '{
-    "model": "llama-3.3-70b-versatile",
-    "messages": [
-      { "role": "user", "content": "Hello, FreeAIModel!" }
-    ],
-    "temperature": 0.7
-  }'`,
+  -H "Content-Type: application/json" \\
+  -d '{"messages": [{"role": "user", "content": "Hello!"}], "model": "${defaultDynamicModel}"}'`,
     python: `from openai import OpenAI
 
 # Direct OpenAI SDK Drop-in
@@ -115,7 +110,7 @@ client = OpenAI(
 )
 
 completion = client.chat.completions.create(
-    model="llama-3.3-70b-versatile",
+    model="${defaultDynamicModel}",
     messages=[{"role": "user", "content": "Explain quantum computing in one sentence."}]
 )
 
@@ -128,7 +123,7 @@ const client = new OpenAI({
 });
 
 const response = await client.chat.completions.create({
-  model: 'llama-3.3-70b-versatile',
+  model: '${defaultDynamicModel}',
   messages: [{ role: 'user', content: 'Explain quantum computing in one sentence.' }],
 });
 
@@ -155,11 +150,11 @@ console.log(response.choices[0].message.content);`
             <div>
               <div className="flex items-center gap-2 flex-wrap">
                 <span className="font-bold text-sm sm:text-base tracking-tight text-white">
-                  ⚡ 50 Billion Free Tokens / 50 Million Free Credits Allocated for Unlimited Developer Testing
+                  ⚡ 50 Billion Free Credits Allocated — Refreshes &amp; Resets Daily for Unlimited Developer Testing
                 </span>
               </div>
               <p className="text-xs text-violet-100/90 mt-0.5">
-                Multi-provider failover active across Groq, OpenAI, Gemini, and OpenRouter with zero 429 downtime.
+                Your 50,000,000,000 free credits refresh automatically every day. Multi-provider failover active across all connected models with zero 429 downtime.
               </p>
             </div>
           </div>
@@ -425,7 +420,7 @@ console.log(response.choices[0].message.content);`
               title="Toggle Custom Domain vs Live Origin"
             >
               <Globe className="w-3 h-3 text-cyan-400" />
-              <span>{useLiveUrl ? 'Live Origin' : 'yourdomain.com'}</span>
+              <span>{useLiveUrl ? 'Local Origin' : 'freeaimodel.vercel.app'}</span>
             </button>
 
             {/* Language Switcher Tabs */}
@@ -512,7 +507,7 @@ console.log(response.choices[0].message.content);`
               <div className="pl-8">
                 <span className="text-sky-300">"model"</span>
                 <span className="text-zinc-400">: </span>
-                <span className="text-emerald-300">"llama-3.3-70b-versatile"</span>
+                <span className="text-emerald-300">"{defaultDynamicModel}"</span>
                 <span className="text-zinc-400">,</span>
               </div>
               <div className="pl-8">
@@ -582,7 +577,7 @@ console.log(response.choices[0].message.content);`
               <div className="pl-4">
                 <span className="text-sky-300">model</span>
                 <span className="text-zinc-400">=</span>
-                <span className="text-emerald-300">"llama-3.3-70b-versatile"</span>
+                <span className="text-emerald-300">"{defaultDynamicModel}"</span>
                 <span className="text-zinc-400">,</span>
               </div>
               <div className="pl-4">
@@ -654,7 +649,7 @@ console.log(response.choices[0].message.content);`
               <div className="pl-4">
                 <span className="text-sky-300">model</span>
                 <span className="text-zinc-400">: </span>
-                <span className="text-emerald-300">'llama-3.3-70b-versatile'</span>
+                <span className="text-emerald-300">'{defaultDynamicModel}'</span>
                 <span className="text-zinc-400">,</span>
               </div>
               <div className="pl-4">

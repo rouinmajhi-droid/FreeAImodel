@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import { ProviderKey, GatewayModel, RequestLog } from '../types/gateway';
 import { useToast } from './Toast';
+import { ProviderLogo } from './ProviderLogo';
 
 interface AdminPanelProps {
   userEmail?: string | null;
@@ -23,7 +24,7 @@ interface AdminPanelProps {
   providerKeys: ProviderKey[];
   models: GatewayModel[];
   logs: RequestLog[];
-  onAddBulkKeys: (keysText: string, provider: string) => Promise<{ addedCount: number; modelsCount: number }>;
+  onAddBulkKeys: (keysText: string, provider: string, customBaseUrl?: string) => Promise<{ addedCount: number; modelsCount: number }>;
   onToggleKeyStatus: (keyId: string, currentStatus: string) => Promise<void>;
   onDeleteProviderKey: (keyId: string) => Promise<void>;
   onResetCooldowns: () => void;
@@ -46,6 +47,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   const [isBulkModalOpen, setIsBulkModalOpen] = useState(false);
   const [bulkKeysText, setBulkKeysText] = useState('');
   const [selectedProvider, setSelectedProvider] = useState<string>('auto');
+  const [customBaseUrl, setCustomBaseUrl] = useState<string>('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [testedKeyId, setTestedKeyId] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<{ id: string; latency?: number; success: boolean; msg?: string } | null>(null);
@@ -71,7 +73,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
         </div>
 
         <p className="text-xs text-zinc-400 mt-3">
-          Designated Administrator: <code className="text-violet-700 font-semibold">rouinmajhi@gmail.com</code>
+          Designated Administrator: <code className="text-violet-700 font-semibold">Rouinmajhi@gmail.com</code>
         </p>
       </div>
     );
@@ -84,8 +86,9 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
 
     setIsSubmitting(true);
     try {
-      const res = await onAddBulkKeys(bulkKeysText, selectedProvider);
+      const res = await onAddBulkKeys(bulkKeysText, selectedProvider, customBaseUrl.trim() || undefined);
       setBulkKeysText('');
+      setCustomBaseUrl('');
       setIsBulkModalOpen(false);
       showToast(
         'Keys Ingested',
@@ -108,7 +111,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
       const res = await fetch('/api/admin/test-key', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider: pk.provider, key: pk.key })
+        body: JSON.stringify({ provider: pk.provider, key: pk.key, customBaseUrl: pk.customBaseUrl })
       });
       const data = await res.json();
       if (data.success) {
@@ -236,6 +239,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
               className="px-2.5 py-1.5 rounded-lg border border-zinc-200 text-xs font-medium bg-white outline-none focus:border-violet-600 text-zinc-700"
             >
               <option value="all">All Providers</option>
+              <option value="inception">Inception</option>
               <option value="groq">Groq</option>
               <option value="openai">OpenAI</option>
               <option value="gemini">Google Gemini</option>
@@ -243,6 +247,8 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
               <option value="deepseek">DeepSeek</option>
               <option value="mistral">Mistral</option>
               <option value="cerebras">Cerebras</option>
+              <option value="anthropic">Anthropic</option>
+              <option value="custom">Custom URL</option>
             </select>
 
             <select
@@ -286,9 +292,19 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                   return (
                     <tr key={pk.id} className="hover:bg-zinc-50/70 transition-colors">
                       <td className="py-3 px-5">
-                        <span className="font-semibold text-zinc-900 uppercase text-[11px] bg-zinc-100 px-2 py-0.5 rounded">
-                          {pk.provider}
-                        </span>
+                        <div className="flex items-center gap-2">
+                          <ProviderLogo provider={pk.provider} size={15} />
+                          <div>
+                            <span className="font-semibold text-zinc-900 uppercase text-[11px] bg-zinc-100 px-2 py-0.5 rounded">
+                              {pk.provider}
+                            </span>
+                            {pk.customBaseUrl && (
+                              <span className="block text-[10px] font-mono text-zinc-400 mt-0.5 truncate max-w-[160px]">
+                                {pk.customBaseUrl}
+                              </span>
+                            )}
+                          </div>
+                        </div>
                       </td>
 
                       <td className="py-3 px-5 font-mono text-zinc-800">
@@ -394,10 +410,19 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                   </label>
                   <select
                     value={selectedProvider}
-                    onChange={(e) => setSelectedProvider(e.target.value)}
+                    onChange={(e) => {
+                      const next = e.target.value;
+                      setSelectedProvider(next);
+                      if (next === 'inception' && !customBaseUrl) {
+                        setCustomBaseUrl('https://api.inceptionlabs.ai/v1');
+                      } else if (next !== 'custom' && next !== 'inception') {
+                        setCustomBaseUrl('');
+                      }
+                    }}
                     className="w-full px-3 py-2 rounded-lg border border-zinc-200 text-xs font-medium bg-white focus:border-violet-600 outline-none text-zinc-700"
                   >
                     <option value="auto">✨ Auto-Detect by Prefix (gsk_, sk-, AIzaSy...)</option>
+                    <option value="inception">Inception Labs (Mercury)</option>
                     <option value="groq">Groq (gsk_...)</option>
                     <option value="openai">OpenAI (sk-...)</option>
                     <option value="gemini">Google Gemini (AIzaSy...)</option>
@@ -405,8 +430,25 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                     <option value="deepseek">DeepSeek (sk-...)</option>
                     <option value="mistral">Mistral</option>
                     <option value="cerebras">Cerebras (csk-...)</option>
+                    <option value="anthropic">Anthropic (sk-ant-...)</option>
+                    <option value="custom">Custom OpenAI-Compatible Endpoint</option>
                   </select>
                 </div>
+
+                {(selectedProvider === 'custom' || selectedProvider === 'inception') && (
+                  <div>
+                    <label className="block text-xs font-semibold text-zinc-700 mb-1.5">
+                      Provider Base URL (for /models discovery & routing)
+                    </label>
+                    <input
+                      type="url"
+                      value={customBaseUrl}
+                      onChange={(e) => setCustomBaseUrl(e.target.value)}
+                      placeholder="https://api.inceptionlabs.ai/v1"
+                      className="w-full px-3 py-2 font-mono text-xs rounded-lg border border-zinc-200 focus:border-violet-600 outline-none"
+                    />
+                  </div>
+                )}
 
                 <div>
                   <label className="block text-xs font-semibold text-zinc-700 mb-1.5 flex items-center justify-between">

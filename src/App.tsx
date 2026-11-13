@@ -4,13 +4,19 @@ import {
   doc, 
   setDoc, 
   getDoc, 
-  deleteDoc 
+  deleteDoc,
+  collection,
+  getDocs,
+  query,
+  where
 } from 'firebase/firestore';
 import { 
   auth, 
   db, 
   isUserAdmin, 
-  DESIGNATED_ADMIN_EMAIL 
+  handleFirestoreError,
+  OperationType,
+  testConnection
 } from './lib/firebase';
 import { ApiKey, ProviderKey, GatewayModel, RequestLog, UserProfile } from './types/gateway';
 import { ToastProvider, useToast } from './components/Toast';
@@ -50,6 +56,7 @@ function GatewayApp() {
   const activeEmail = currentUser?.email || devUser?.email;
   const activeUid = currentUser?.uid || devUser?.uid || 'usr_developer';
   const isAdmin = isUserAdmin(activeEmail, userProfile?.role);
+  const isAuthenticated = Boolean(currentUser || devUser);
 
   // Sync with URL routing
   useEffect(() => {
@@ -80,7 +87,20 @@ function GatewayApp() {
     return () => window.removeEventListener('popstate', checkPath);
   }, []);
 
+  // Hide /admin route for non-admin authenticated users
+  useEffect(() => {
+    if (!authLoading && isAuthenticated && activeTab === 'admin' && !isAdmin) {
+      setActiveTab('dashboard');
+      window.history.replaceState(null, '', '/');
+    }
+  }, [authLoading, isAuthenticated, activeTab, isAdmin]);
+
   const handleSelectTab = (tab: NavTab) => {
+    if (tab === 'admin' && !isAdmin) {
+      setActiveTab('dashboard');
+      window.history.pushState(null, '', '/');
+      return;
+    }
     setActiveTab(tab);
     if (tab === 'dashboard') {
       window.history.pushState(null, '', '/');
@@ -91,8 +111,27 @@ function GatewayApp() {
     }
   };
 
+  // Helper to strip undefined fields before writing to Firestore
+  const sanitizeForFirestore = <T extends Record<string, any>>(obj: T): Partial<T> => {
+    const clean: Record<string, any> = {};
+    for (const [k, v] of Object.entries(obj)) {
+      if (v !== undefined) clean[k] = v;
+    }
+    return clean as Partial<T>;
+  };
+
+  const toFirestoreDocId = (rawId: string): string => {
+    const sanitized = rawId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 128);
+    return sanitized || 'id_' + Math.random().toString(36).substring(2, 10);
+  };
+
   // Sync state with backend memory router (keys + models from Admin Panel)
-  const syncWithBackend = useCallback(async (currentApiKeys: ApiKey[], currentProviderKeys: ProviderKey[], currentModels?: GatewayModel[]) => {
+  const syncWithBackend = useCallback(async (
+    currentApiKeys: ApiKey[],
+    currentProviderKeys: ProviderKey[],
+    currentModels?: GatewayModel[],
+    replaceProviderKeys = false
+  ) => {
     try {
       await fetch('/api/gateway/sync', {
         method: 'POST',
@@ -100,42 +139,96 @@ function GatewayApp() {
         body: JSON.stringify({ 
           apiKeys: currentApiKeys, 
           providerKeys: currentProviderKeys,
-          models: currentModels
+          models: currentModels,
+          replaceProviderKeys
         })
       });
-    } catch (e) {
+    } catch {
       // background sync
     }
   }, []);
 
-  // Firebase Auth State Listener
+  // Firebase Auth State Listener — checks Rouinmajhi@gmail.com for Admin role & runs daily 50B credits reset
   useEffect(() => {
+    const DAILY_CREDITS = 50_000_000_000;
+
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
       setCurrentUser(user);
       if (user) {
         setDevUser(null);
+        const isAdm = isUserAdmin(user.email);
+        const expectedRole: 'admin' | 'user' = isAdm ? 'admin' : 'user';
+        const today = new Date().toISOString().slice(0, 10);
+        const nowIso = new Date().toISOString();
+
+        // Notify backend session for role verification and daily credits reset
+        fetch('/api/auth/session', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            uid: user.uid,
+            email: user.email || '',
+            displayName: user.displayName || 'Developer'
+          })
+        }).catch(() => {});
+
         try {
           const profileRef = doc(db, 'user_profiles', user.uid);
           const snap = await getDoc(profileRef);
 
           if (snap.exists()) {
-            setUserProfile(snap.data() as UserProfile);
+            const existing = snap.data() as UserProfile;
+            const needsDailyReset =
+              !existing.updatedAt ||
+              existing.updatedAt.slice(0, 10) !== today ||
+              (existing.freeCreditsAllocated || 0) < DAILY_CREDITS;
+            const needsRoleUpdate = existing.role !== expectedRole;
+
+            const updatedProfile: UserProfile = {
+              ...existing,
+              email: user.email || existing.email,
+              displayName: user.displayName || existing.displayName || 'Developer',
+              role: expectedRole,
+              freeCreditsAllocated: DAILY_CREDITS,
+              freeCreditsSpent: needsDailyReset ? 0 : (existing.freeCreditsSpent || 0),
+              updatedAt: nowIso
+            };
+
+            if (needsDailyReset || needsRoleUpdate) {
+              try {
+                await setDoc(profileRef, sanitizeForFirestore(updatedProfile));
+              } catch (writeErr) {
+                try {
+                  handleFirestoreError(writeErr, OperationType.UPDATE, `user_profiles/${user.uid}`);
+                } catch {
+                  // Non-blocking fallback
+                }
+              }
+            }
+            setUserProfile(updatedProfile);
           } else {
-            const isAdm = isUserAdmin(user.email);
             const initialProfile: UserProfile = {
               uid: user.uid,
               email: user.email || '',
               displayName: user.displayName || 'Developer',
               photoURL: user.photoURL || undefined,
-              role: isAdm ? 'admin' : 'user',
-              freeCreditsAllocated: 0,
+              role: expectedRole,
+              freeCreditsAllocated: DAILY_CREDITS,
               freeCreditsSpent: 0,
               totalRequests: 0,
               totalTokens: 0,
-              createdAt: new Date().toISOString(),
-              updatedAt: new Date().toISOString()
+              createdAt: nowIso,
+              updatedAt: nowIso
             };
-            await setDoc(profileRef, initialProfile);
+            try {
+              await setDoc(profileRef, sanitizeForFirestore(initialProfile));
+            } catch (writeErr) {
+              try {
+                handleFirestoreError(writeErr, OperationType.CREATE, `user_profiles/${user.uid}`);
+              } catch {
+                // Non-blocking fallback
+              }
+            }
             setUserProfile(initialProfile);
           }
         } catch (err) {
@@ -143,13 +236,13 @@ function GatewayApp() {
             uid: user.uid,
             email: user.email || '',
             displayName: user.displayName || 'Developer',
-            role: isUserAdmin(user.email) ? 'admin' : 'user',
-            freeCreditsAllocated: 0,
+            role: expectedRole,
+            freeCreditsAllocated: DAILY_CREDITS,
             freeCreditsSpent: 0,
             totalRequests: 0,
             totalTokens: 0,
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString()
+            createdAt: nowIso,
+            updatedAt: nowIso
           });
         }
       } else {
@@ -161,90 +254,136 @@ function GatewayApp() {
     return () => unsubscribe();
   }, []);
 
-  // Initialize data
+  // Initialize data & synchronize with Firestore + Gateway Backend
   useEffect(() => {
+    let cancelled = false;
+
     const initializeData = async () => {
-      // 1. Fetch models
+      testConnection();
+
+      let loadedModels: GatewayModel[] = [];
+      let loadedApiKeys: ApiKey[] = [];
+      let loadedProviderKeys: ProviderKey[] = [];
+
+      // 1. Fetch public/cached models from gateway backend
       try {
-        const res = await fetch('/v1/models');
+        const res = await fetch('/api/models');
         if (res.ok) {
           const data = await res.json();
           if (Array.isArray(data.data)) {
-            setModels(data.data.map((m: any) => ({
+            loadedModels = data.data.map((m: any) => ({
               id: m.id,
-              name: m.id.replace(/[-_]/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
-              provider: m.owned_by || 'groq',
+              name: m.name || m.id.replace(/[-_]/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
+              provider: m.provider || m.owned_by || 'groq',
               discoveredAt: new Date().toISOString()
-            })));
+            }));
           }
         }
       } catch (e) {
-        console.warn('Failed to load models:', e);
+        console.warn('Failed to load models from backend:', e);
       }
 
-      // 2. Fetch stats & logs
+      // 2. Fetch live stats & logs
       try {
         const statsRes = await fetch('/api/stats');
         if (statsRes.ok) {
           const statsData = await statsRes.json();
-          if (Array.isArray(statsData.logs)) {
+          if (!cancelled && Array.isArray(statsData.logs)) {
             setRequestLogs(statsData.logs);
           }
         }
-      } catch (e) {
+      } catch {
         // Ignore
       }
 
-      // 3. Baseline Master Key Pool
-      const initialPool: ProviderKey[] = [
-        {
-          id: 'pk_groq_primary',
-          provider: 'groq',
-          key: 'gsk_master_pool_key_alpha_79x1',
-          keyHint: 'gsk_...79x1',
-          status: 'active',
-          supportedModels: ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant'],
-          requestCount: 0,
-          errorCount: 0,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString()
-        },
-        {
-          id: 'pk_openai_backup',
-          provider: 'openai',
-          key: 'sk-proj-master_pool_key_beta_99v2',
-          keyHint: 'sk-p...99v2',
-          status: 'active',
-          supportedModels: ['gpt-4o', 'gpt-4o-mini'],
-          requestCount: 0,
-          errorCount: 0,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString()
-        },
-        {
-          id: 'pk_gemini_rotator',
-          provider: 'gemini',
-          key: 'AIzaSyMasterPoolKeyGamma43k',
-          keyHint: 'AIza...43k',
-          status: 'active',
-          supportedModels: ['gemini-2.0-flash', 'gemini-1.5-pro'],
-          requestCount: 0,
-          errorCount: 0,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString()
+      // 3. When authenticated with Firebase, load user's persisted API keys, models & (if admin) provider pool
+      if (currentUser) {
+        try {
+          const keysQ = query(collection(db, 'api_keys'), where('userId', '==', currentUser.uid));
+          const keysSnap = await getDocs(keysQ);
+          loadedApiKeys = keysSnap.docs.map(d => d.data() as ApiKey);
+        } catch (err) {
+          try {
+            handleFirestoreError(err, OperationType.LIST, 'api_keys');
+          } catch {
+            // Non-blocking fallback
+          }
         }
-      ];
 
-      setProviderKeys(initialPool);
+        try {
+          const modelsSnap = await getDocs(collection(db, 'models'));
+          if (!modelsSnap.empty) {
+            const firestoreModels = modelsSnap.docs.map(d => d.data() as GatewayModel);
+            if (firestoreModels.length > 0) {
+              loadedModels = firestoreModels;
+            }
+          }
+        } catch (err) {
+          console.warn('Could not read models from Firestore:', err);
+        }
 
-      // Start with clean 0 keys so endpoint remains hidden until user creates their first key
-      setApiKeys([]);
+        if (isAdmin) {
+          try {
+            const pkSnap = await getDocs(collection(db, 'provider_keys'));
+            const firestorePool = pkSnap.docs.map(d => d.data() as ProviderKey);
 
-      syncWithBackend([], initialPool);
+            // Also check any keys already in backend cache
+            const adminKeysRes = await fetch('/api/admin/keys', {
+              headers: { 'x-user-email': currentUser.email || '' }
+            }).catch(() => null);
+            const backendPool: ProviderKey[] = adminKeysRes && adminKeysRes.ok
+              ? ((await adminKeysRes.json()).keys || [])
+              : [];
+
+            const mergedMap = new Map<string, ProviderKey>();
+            for (const pk of backendPool) mergedMap.set(pk.id, pk);
+            for (const pk of firestorePool) mergedMap.set(pk.id, pk);
+            loadedProviderKeys = Array.from(mergedMap.values());
+          } catch (err) {
+            console.warn('Could not load provider_keys from Firestore:', err);
+          }
+        }
+      }
+
+      if (cancelled) return;
+
+      setModels(loadedModels);
+      setApiKeys(loadedApiKeys);
+      setProviderKeys(loadedProviderKeys);
+
+      await syncWithBackend(
+        loadedApiKeys,
+        loadedProviderKeys,
+        loadedModels,
+        loadedProviderKeys.length > 0
+      );
+
+      // Re-read backend models in case backend rebuilt from synced provider keys
+      if (loadedProviderKeys.length > 0) {
+        try {
+          const refreshedRes = await fetch('/api/models');
+          if (refreshedRes.ok) {
+            const refreshedData = await refreshedRes.json();
+            if (!cancelled && Array.isArray(refreshedData.data)) {
+              setModels(refreshedData.data.map((m: any) => ({
+                id: m.id,
+                name: m.name || m.id.replace(/[-_]/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
+                provider: m.provider || m.owned_by || 'groq',
+                discoveredAt: new Date().toISOString()
+              })));
+            }
+          }
+        } catch {
+          // Ignore
+        }
+      }
     };
 
     initializeData();
-  }, [activeUid, syncWithBackend]);
+    return () => {
+      cancelled = true;
+    };
+  }, [currentUser, isAdmin, syncWithBackend]);
 
   // Dev Quick Login for testing inside sandboxes
   const handleDevQuickLogin = (email: string, displayName: string) => {
@@ -325,12 +464,36 @@ function GatewayApp() {
     syncWithBackend(updated, providerKeys);
   };
 
-  // Admin Bulk Add Provider Keys
-  const handleAddBulkProviderKeys = async (keysText: string, provider: string) => {
+  // Persist discovered models list to Firestore (Admin only)
+  const syncModelsToFirestore = useCallback(async (modelsList: GatewayModel[]) => {
+    if (!currentUser || !isAdmin) return;
+    try {
+      // Clear removed models from Firestore and write active ones
+      const existingSnap = await getDocs(collection(db, 'models'));
+      const activeDocIds = new Set(modelsList.map(m => toFirestoreDocId(m.id)));
+      for (const d of existingSnap.docs) {
+        if (!activeDocIds.has(d.id)) {
+          await deleteDoc(doc(db, 'models', d.id));
+        }
+      }
+      for (const m of modelsList) {
+        const docId = toFirestoreDocId(m.id);
+        await setDoc(doc(db, 'models', docId), sanitizeForFirestore(m));
+      }
+    } catch (err) {
+      console.warn('Could not persist models to Firestore:', err);
+    }
+  }, [currentUser, isAdmin]);
+
+  // Admin Bulk Add Provider Keys & Auto-Discover Models
+  const handleAddBulkProviderKeys = async (keysText: string, provider: string, customBaseUrl?: string) => {
     const res = await fetch('/api/admin/bulk-add-keys', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ keysText, provider })
+      headers: {
+        'Content-Type': 'application/json',
+        'x-user-email': activeEmail || ''
+      },
+      body: JSON.stringify({ keysText, provider, customBaseUrl })
     });
 
     if (!res.ok) {
@@ -340,16 +503,31 @@ function GatewayApp() {
 
     const data = await res.json();
 
-    const modelsRes = await fetch('/v1/models');
-    if (modelsRes.ok) {
-      const modelsData = await modelsRes.json();
-      if (Array.isArray(modelsData.data)) {
-        setModels(modelsData.data.map((m: any) => ({
-          id: m.id,
-          name: m.id.replace(/[-_]/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
-          provider: m.owned_by || 'groq',
-          discoveredAt: new Date().toISOString()
-        })));
+    let nextModels: GatewayModel[] = [];
+    if (Array.isArray(data.models)) {
+      nextModels = data.models.map((m: any) => ({
+        id: m.id,
+        name: m.name || m.id.replace(/[-_]/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
+        provider: m.provider || 'custom',
+        ownerKeyId: m.ownerKeyId,
+        ownerKeyHint: m.ownerKeyHint,
+        contextWindow: m.contextWindow,
+        discoveredAt: m.discoveredAt || new Date().toISOString()
+      }));
+      setModels(nextModels);
+    } else {
+      const modelsRes = await fetch('/api/models');
+      if (modelsRes.ok) {
+        const modelsData = await modelsRes.json();
+        if (Array.isArray(modelsData.data)) {
+          nextModels = modelsData.data.map((m: any) => ({
+            id: m.id,
+            name: m.name || m.id.replace(/[-_]/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
+            provider: m.provider || m.owned_by || 'custom',
+            discoveredAt: new Date().toISOString()
+          }));
+          setModels(nextModels);
+        }
       }
     }
 
@@ -357,16 +535,30 @@ function GatewayApp() {
       const newKeys: ProviderKey[] = data.keys.map((k: any) => ({
         id: k.id,
         provider: k.provider,
-        key: k.key || 'sk-provider-secret',
+        key: k.key,
         keyHint: k.keyHint,
+        customBaseUrl: k.customBaseUrl,
         status: k.status || 'active',
-        supportedModels: data.discoveredModelsSummary?.[k.keyHint] || [],
+        supportedModels: k.supportedModels || data.discoveredModelsSummary?.[k.keyHint] || [],
         requestCount: 0,
         errorCount: 0,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
+        lastError: k.lastError,
+        createdAt: k.createdAt || new Date().toISOString(),
+        updatedAt: k.updatedAt || new Date().toISOString()
       }));
       setProviderKeys(prev => [...newKeys, ...prev]);
+
+      // Persist new keys & discovered models to Firestore
+      if (currentUser && isAdmin) {
+        for (const pk of newKeys) {
+          try {
+            await setDoc(doc(db, 'provider_keys', toFirestoreDocId(pk.id)), sanitizeForFirestore(pk));
+          } catch (err) {
+            console.warn('Could not persist provider_key to Firestore:', err);
+          }
+        }
+        await syncModelsToFirestore(nextModels);
+      }
     }
 
     return {
@@ -377,39 +569,114 @@ function GatewayApp() {
 
   const handleToggleKeyStatus = async (keyId: string, currentStatus: string) => {
     const newStatus = currentStatus === 'disabled' ? 'active' : 'disabled';
-    const updated = providerKeys.map(k => k.id === keyId ? { ...k, status: newStatus as any } : k);
+    const updated = providerKeys.map(k => k.id === keyId ? { ...k, status: newStatus as any, updatedAt: new Date().toISOString() } : k);
     setProviderKeys(updated);
-    syncWithBackend(apiKeys, updated);
+
+    try {
+      const res = await fetch(`/api/admin/keys/${encodeURIComponent(keyId)}/status`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-user-email': activeEmail || ''
+        },
+        body: JSON.stringify({ status: newStatus })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.models)) {
+          setModels(data.models);
+          await syncModelsToFirestore(data.models);
+        }
+      } else {
+        await syncWithBackend(apiKeys, updated, undefined, true);
+      }
+    } catch {
+      await syncWithBackend(apiKeys, updated, undefined, true);
+    }
+
+    if (currentUser && isAdmin) {
+      const target = updated.find(k => k.id === keyId);
+      if (target) {
+        try {
+          await setDoc(doc(db, 'provider_keys', toFirestoreDocId(keyId)), sanitizeForFirestore(target));
+        } catch (err) {
+          console.warn('Could not update provider_key in Firestore:', err);
+        }
+      }
+    }
+
     showToast('Status Updated', `Key is now ${newStatus}.`, 'info');
   };
 
   const handleDeleteProviderKey = async (keyId: string) => {
     const updated = providerKeys.filter(k => k.id !== keyId);
     setProviderKeys(updated);
-    syncWithBackend(apiKeys, updated);
+
+    try {
+      const res = await fetch(`/api/admin/keys/${encodeURIComponent(keyId)}`, {
+        method: 'DELETE',
+        headers: { 'x-user-email': activeEmail || '' }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.models)) {
+          setModels(data.models);
+          await syncModelsToFirestore(data.models);
+        }
+      }
+    } catch {
+      await syncWithBackend(apiKeys, updated, undefined, true);
+    }
+
+    if (currentUser && isAdmin) {
+      try {
+        await deleteDoc(doc(db, 'provider_keys', toFirestoreDocId(keyId)));
+      } catch (err) {
+        console.warn('Could not delete provider_key from Firestore:', err);
+      }
+    }
+
     showToast('Key Removed', 'Provider key removed from Master Pool.', 'info');
   };
 
   const handleResetCooldowns = () => {
     const updated = providerKeys.map(k => k.status === 'rate_limited' ? { ...k, status: 'active' as const, cooldownUntil: undefined } : k);
     setProviderKeys(updated);
-    syncWithBackend(apiKeys, updated);
+    syncWithBackend(apiKeys, updated, undefined, true);
     showToast('Cooldowns Cleared', 'All rate-limited provider keys restored.', 'success');
   };
 
   const handleRefreshModels = async () => {
     try {
-      const res = await fetch('/v1/models');
+      const res = await fetch('/api/models/refresh', { method: 'POST' });
       if (res.ok) {
         const data = await res.json();
-        if (Array.isArray(data.data)) {
-          setModels(data.data.map((m: any) => ({
+        if (Array.isArray(data.models)) {
+          const nextModels: GatewayModel[] = data.models.map((m: any) => ({
             id: m.id,
-            name: m.id.replace(/[-_]/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
-            provider: m.owned_by || 'groq',
+            name: m.name || m.id.replace(/[-_]/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
+            provider: m.provider || 'custom',
+            ownerKeyId: m.ownerKeyId,
+            ownerKeyHint: m.ownerKeyHint,
+            discoveredAt: m.discoveredAt || new Date().toISOString()
+          }));
+          setModels(nextModels);
+          await syncModelsToFirestore(nextModels);
+          showToast('Models Refreshed', `${nextModels.length} models synced from provider keys.`, 'success');
+          return;
+        }
+      }
+      const fallbackRes = await fetch('/api/models');
+      if (fallbackRes.ok) {
+        const fallbackData = await fallbackRes.json();
+        if (Array.isArray(fallbackData.data)) {
+          setModels(fallbackData.data.map((m: any) => ({
+            id: m.id,
+            name: m.name || m.id.replace(/[-_]/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
+            provider: m.provider || m.owned_by || 'groq',
             discoveredAt: new Date().toISOString()
           })));
-          showToast('Models Refreshed', `${data.data.length} models discoverable.`, 'success');
+          showToast('Models Refreshed', `${fallbackData.data.length} models discoverable.`, 'success');
         }
       }
     } catch (e: any) {
@@ -435,8 +702,6 @@ function GatewayApp() {
 
   const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
   const realDailyUsage = requestLogs.filter(l => new Date(l.timestamp).getTime() >= oneDayAgo).length;
-
-  const isAuthenticated = Boolean(currentUser || devUser);
 
   // If user navigated to /login or clicked "Get Free API Key" or clicked "Sign In"
   if (!isAuthenticated && (isLoginRoute || showAuthModal)) {
@@ -530,6 +795,16 @@ function GatewayApp() {
           onLogout={handleSignOut}
         />
 
+        {/* Top Notification Banner: 50 Billion Free Credits Daily Reset */}
+        <div className="bg-gradient-to-r from-violet-600 via-purple-600 to-indigo-600 text-white px-6 sm:px-8 py-2.5 border-b border-violet-700/40 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+          <span className="font-semibold tracking-tight">
+            ⚡ 50 Billion Free Credits Allocated — Refreshes &amp; Resets Daily for Unlimited Developer Testing
+          </span>
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-white/15 border border-white/20 text-[11px] font-mono font-semibold w-fit shrink-0">
+            50.0B Credits • Daily Reset Active
+          </span>
+        </div>
+
         {/* Tab View Container - Standardized full width container */}
         <main className="flex-1 max-w-6xl w-full mx-auto px-6 sm:px-8 py-8">
           {activeTab === 'dashboard' && (
@@ -580,7 +855,7 @@ function GatewayApp() {
             />
           )}
 
-          {activeTab === 'admin' && (
+          {activeTab === 'admin' && isAdmin && (
             <AdminPanel
               userEmail={activeEmail}
               isAdmin={isAdmin}

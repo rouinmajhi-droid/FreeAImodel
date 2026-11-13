@@ -22,11 +22,11 @@ export const githubProvider = new GithubAuthProvider();
 export const microsoftProvider = new OAuthProvider('microsoft.com');
 microsoftProvider.setCustomParameters({ prompt: 'select_account' });
 
-export const DESIGNATED_ADMIN_EMAIL = 'rouinmajhi@gmail.com';
+export const DESIGNATED_ADMIN_EMAIL = 'Rouinmajhi@gmail.com';
 
-export function isUserAdmin(email?: string | null, role?: string): boolean {
+export function isUserAdmin(email?: string | null, _role?: string): boolean {
   if (!email) return false;
-  return email.toLowerCase() === DESIGNATED_ADMIN_EMAIL.toLowerCase() || role === 'admin';
+  return email.trim().toLowerCase() === DESIGNATED_ADMIN_EMAIL.toLowerCase();
 }
 
 export enum OperationType {

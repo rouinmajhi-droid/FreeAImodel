@@ -13,6 +13,29 @@ export const ProviderLogo: React.FC<ProviderLogoProps> = ({
 }) => {
   const norm = (provider || '').toLowerCase().trim();
 
+  // Inception Labs
+  if (norm.includes('inception') || norm.includes('mercury')) {
+    return (
+      <svg
+        width={size}
+        height={size}
+        viewBox="0 0 24 24"
+        fill="none"
+        className={`shrink-0 ${className}`}
+        aria-label="Inception"
+      >
+        <rect width="24" height="24" rx="5" fill="#7C3AED" />
+        <path
+          d="M12 5L18.5 12L12 19L5.5 12L12 5Z"
+          stroke="white"
+          strokeWidth="2"
+          strokeLinejoin="round"
+        />
+        <circle cx="12" cy="12" r="2.2" fill="white" />
+      </svg>
+    );
+  }
+
   // OpenAI
   if (norm.includes('openai') || norm.startsWith('gpt') || norm.startsWith('o1') || norm.startsWith('o3')) {
     return (

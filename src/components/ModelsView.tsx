@@ -19,7 +19,7 @@ interface ModelsViewProps {
   models: GatewayModel[];
   providerKeys: ProviderKey[];
   onSelectModelForPlayground: (modelId: string) => void;
-  onAddKeyAndFetchModels: (keysText: string, provider: string) => Promise<{ addedCount: number; modelsCount: number }>;
+  onAddKeyAndFetchModels: (keysText: string, provider: string, customBaseUrl?: string) => Promise<{ addedCount: number; modelsCount: number }>;
   onRefreshModels: () => Promise<void>;
   onDeleteKey?: (keyId: string) => void;
 }
@@ -40,6 +40,7 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [inputKeys, setInputKeys] = useState('');
   const [selectedProvider, setSelectedProvider] = useState('auto');
+  const [customBaseUrl, setCustomBaseUrl] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [addResult, setAddResult] = useState<{ message: string; isError?: boolean } | null>(null);
@@ -61,12 +62,13 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
     setAddResult(null);
 
     try {
-      const res = await onAddKeyAndFetchModels(inputKeys, selectedProvider);
+      const res = await onAddKeyAndFetchModels(inputKeys, selectedProvider, customBaseUrl.trim() || undefined);
       setAddResult({
         message: `Success! Added ${res.addedCount} key(s) and discovered ${res.modelsCount} model(s).`,
         isError: false
       });
       setInputKeys('');
+      setCustomBaseUrl('');
       setTimeout(() => {
         setIsAddModalOpen(false);
         setAddResult(null);
@@ -234,6 +236,7 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
             className="px-3 py-2 text-xs rounded-lg border border-zinc-200 bg-white outline-none focus:border-violet-600 font-medium text-zinc-700 cursor-pointer"
           >
             <option value="all">All Providers</option>
+            <option value="inception">Inception</option>
             <option value="groq">Groq</option>
             <option value="openai">OpenAI</option>
             <option value="gemini">Google Gemini</option>
@@ -241,6 +244,8 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
             <option value="deepseek">DeepSeek</option>
             <option value="mistral">Mistral</option>
             <option value="cerebras">Cerebras</option>
+            <option value="anthropic">Anthropic</option>
+            <option value="custom">Custom URL</option>
           </select>
         </div>
       </div>
@@ -362,10 +367,19 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
                 </label>
                 <select
                   value={selectedProvider}
-                  onChange={(e) => setSelectedProvider(e.target.value)}
+                  onChange={(e) => {
+                    const next = e.target.value;
+                    setSelectedProvider(next);
+                    if (next === 'inception' && !customBaseUrl) {
+                      setCustomBaseUrl('https://api.inceptionlabs.ai/v1');
+                    } else if (next !== 'custom' && next !== 'inception') {
+                      setCustomBaseUrl('');
+                    }
+                  }}
                   className="w-full px-3 py-2 text-xs rounded-lg border border-zinc-200 bg-white outline-none focus:border-violet-600 font-medium text-zinc-800"
                 >
                   <option value="auto">Auto-Detect by Key Prefix (Recommended)</option>
+                  <option value="inception">Inception Labs (Mercury)</option>
                   <option value="groq">Groq (keys start with gsk_)</option>
                   <option value="openai">OpenAI (keys start with sk-...)</option>
                   <option value="gemini">Google Gemini (keys start with AIzaSy...)</option>
@@ -373,8 +387,25 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
                   <option value="deepseek">DeepSeek (keys start with sk-...)</option>
                   <option value="mistral">Mistral (32-character token)</option>
                   <option value="cerebras">Cerebras (keys start with csk-...)</option>
+                  <option value="anthropic">Anthropic (keys start with sk-ant-...)</option>
+                  <option value="custom">Custom OpenAI-Compatible Endpoint</option>
                 </select>
               </div>
+
+              {(selectedProvider === 'custom' || selectedProvider === 'inception') && (
+                <div>
+                  <label className="block text-xs font-medium text-zinc-700 mb-1.5">
+                    Provider Base URL
+                  </label>
+                  <input
+                    type="url"
+                    value={customBaseUrl}
+                    onChange={(e) => setCustomBaseUrl(e.target.value)}
+                    placeholder="https://api.inceptionlabs.ai/v1"
+                    className="w-full px-3 py-2 font-mono text-xs rounded-lg border border-zinc-200 focus:border-violet-600 outline-none bg-zinc-50"
+                  />
+                </div>
+              )}
 
               <div>
                 <div className="flex items-center justify-between mb-1.5">

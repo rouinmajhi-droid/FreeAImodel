@@ -1,12 +1,26 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import fs from 'fs';
+import path from 'path';
 
 dotenv.config();
 
 export const gatewayApp = express();
 gatewayApp.use(cors());
 gatewayApp.use(express.json({ limit: '10mb' }));
+
+export type SupportedProvider =
+  | 'inception'
+  | 'groq'
+  | 'openai'
+  | 'gemini'
+  | 'openrouter'
+  | 'deepseek'
+  | 'mistral'
+  | 'cerebras'
+  | 'anthropic'
+  | 'custom';
 
 export interface StoredApiKey {
   id: string;
@@ -23,9 +37,10 @@ export interface StoredApiKey {
 
 export interface StoredProviderKey {
   id: string;
-  provider: 'groq' | 'openai' | 'gemini' | 'openrouter' | 'deepseek' | 'mistral' | 'cerebras' | 'custom';
+  provider: SupportedProvider;
   key: string;
   keyHint: string;
+  customBaseUrl?: string;
   status: 'active' | 'rate_limited' | 'exhausted' | 'disabled';
   supportedModels: string[];
   requestCount: number;
@@ -40,6 +55,8 @@ export interface StoredModel {
   id: string;
   name: string;
   provider: string;
+  ownerKeyId?: string;
+  ownerKeyHint?: string;
   contextWindow?: number;
   pricingPrompt?: number;
   pricingCompletion?: number;
@@ -64,13 +81,50 @@ export interface StoredRequestLog {
   failoverAttempts?: number;
 }
 
-// In-memory master stores (persisted across live gateway sessions and synchronized with UI/Firestore)
+export const PRIMARY_ADMIN_EMAIL = 'Rouinmajhi@gmail.com';
+export const DAILY_FREE_CREDITS = 50_000_000_000;
+
+export interface StoredUserAccount {
+  uid: string;
+  email: string;
+  displayName: string;
+  role: 'admin' | 'user';
+  freeCreditsAllocated: number;
+  freeCreditsSpent: number;
+  lastResetDate: string; // YYYY-MM-DD (UTC)
+  updatedAt: string;
+}
+
+export function isPrimaryAdminEmail(email?: string | null): boolean {
+  if (!email) return false;
+  return email.trim().toLowerCase() === PRIMARY_ADMIN_EMAIL.toLowerCase();
+}
+
+export function getUtcTodayString(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+export function ensureDailyCreditsReset(account: StoredUserAccount): boolean {
+  const today = getUtcTodayString();
+  if (account.lastResetDate !== today || account.freeCreditsAllocated < DAILY_FREE_CREDITS) {
+    account.freeCreditsAllocated = DAILY_FREE_CREDITS;
+    account.freeCreditsSpent = 0;
+    account.lastResetDate = today;
+    account.updatedAt = new Date().toISOString();
+    return true;
+  }
+  return false;
+}
+
+// ==========================================
+// In-memory Master Stores + File Persistence Cache
+// ==========================================
 export const masterApiKeys = new Map<string, StoredApiKey>();
 export const masterProviderKeys: StoredProviderKey[] = [];
 export const masterModels = new Map<string, StoredModel>();
 export const masterLogs: StoredRequestLog[] = [];
+export const masterUsers = new Map<string, StoredUserAccount>();
 
-// Seed default initial models
 const defaultInitialModels: StoredModel[] = [
   { id: 'llama-3.3-70b-versatile', name: 'Llama 3.3 70B Versatile', provider: 'groq', contextWindow: 128000, pricingPrompt: 0.00059, pricingCompletion: 0.00079, discoveredAt: new Date().toISOString() },
   { id: 'llama-3.1-8b-instant', name: 'Llama 3.1 8B Instant', provider: 'groq', contextWindow: 128000, pricingPrompt: 0.00005, pricingCompletion: 0.00008, discoveredAt: new Date().toISOString() },
@@ -81,15 +135,108 @@ const defaultInitialModels: StoredModel[] = [
   { id: 'deepseek-chat', name: 'DeepSeek-V3 Chat', provider: 'deepseek', contextWindow: 64000, pricingPrompt: 0.00014, pricingCompletion: 0.00028, discoveredAt: new Date().toISOString() },
   { id: 'deepseek-reasoner', name: 'DeepSeek-R1 Reasoner', provider: 'deepseek', contextWindow: 64000, pricingPrompt: 0.00055, pricingCompletion: 0.00219, discoveredAt: new Date().toISOString() },
   { id: 'mistral-large-latest', name: 'Mistral Large 2', provider: 'mistral', contextWindow: 128000, pricingPrompt: 0.002, pricingCompletion: 0.006, discoveredAt: new Date().toISOString() },
+  { id: 'mercury-coder-small', name: 'Mercury Coder Small', provider: 'inception', contextWindow: 128000, pricingPrompt: 0.0002, pricingCompletion: 0.0006, discoveredAt: new Date().toISOString() },
   { id: 'llama-3.3-70b', name: 'Cerebras Llama 3.3 70B Ultra-Fast', provider: 'cerebras', contextWindow: 8192, pricingPrompt: 0.0006, pricingCompletion: 0.0006, discoveredAt: new Date().toISOString() }
 ];
 
-for (const m of defaultInitialModels) {
-  masterModels.set(m.id, m);
+function getCacheFilePath(): string {
+  const cwdPath = path.resolve(process.cwd(), '.gateway-cache.json');
+  try {
+    // Check if cwd is writable (not read-only serverless bundle)
+    fs.accessSync(process.cwd(), fs.constants.W_OK);
+    return cwdPath;
+  } catch {
+    return '/tmp/.gateway-cache.json';
+  }
 }
 
-// Provider Base URL endpoints
+export function saveGatewayCache(): void {
+  try {
+    const filePath = getCacheFilePath();
+    const payload = {
+      apiKeys: Array.from(masterApiKeys.values()),
+      providerKeys: masterProviderKeys,
+      models: Array.from(masterModels.values()),
+      logs: masterLogs.slice(0, 200),
+      users: Array.from(masterUsers.values()),
+      updatedAt: new Date().toISOString()
+    };
+    fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf-8');
+  } catch (err) {
+    // Non-fatal in constrained environments
+  }
+}
+
+function loadGatewayCache(): void {
+  try {
+    const candidates = [
+      path.resolve(process.cwd(), '.gateway-cache.json'),
+      '/tmp/.gateway-cache.json'
+    ];
+    for (const filePath of candidates) {
+      if (fs.existsSync(filePath)) {
+        const raw = fs.readFileSync(filePath, 'utf-8');
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed.apiKeys)) {
+          for (const k of parsed.apiKeys) {
+            if (k?.key) masterApiKeys.set(k.key, k);
+          }
+        }
+        if (Array.isArray(parsed.providerKeys)) {
+          masterProviderKeys.length = 0;
+          for (const pk of parsed.providerKeys) {
+            if (pk?.id && pk?.key) masterProviderKeys.push(pk);
+          }
+        }
+        if (Array.isArray(parsed.models) && parsed.models.length > 0) {
+          masterModels.clear();
+          for (const m of parsed.models) {
+            if (m?.id) masterModels.set(m.id, m);
+          }
+        }
+        if (Array.isArray(parsed.logs)) {
+          masterLogs.length = 0;
+          masterLogs.push(...parsed.logs);
+        }
+        if (Array.isArray(parsed.users)) {
+          masterUsers.clear();
+          for (const u of parsed.users) {
+            if (u?.uid) masterUsers.set(u.uid, u);
+          }
+        }
+        return;
+      }
+    }
+  } catch {
+    // Ignore parse errors
+  }
+
+  // Fallback to default showcase models if nothing persisted yet
+  if (masterModels.size === 0) {
+    for (const m of defaultInitialModels) {
+      masterModels.set(m.id, m);
+    }
+  }
+}
+
+loadGatewayCache();
+
+// Ensure initial showcase models if cache was empty
+if (masterProviderKeys.length === 0 && masterModels.size === 0) {
+  for (const m of defaultInitialModels) {
+    masterModels.set(m.id, m);
+  }
+}
+
+// ==========================================
+// Provider Endpoints & URL Normalization
+// ==========================================
 export const PROVIDER_CONFIGS: Record<string, { baseUrl: string; chatPath: string; modelsPath: string }> = {
+  inception: {
+    baseUrl: 'https://api.inceptionlabs.ai/v1',
+    chatPath: '/chat/completions',
+    modelsPath: '/models'
+  },
   groq: {
     baseUrl: 'https://api.groq.com/openai/v1',
     chatPath: '/chat/completions',
@@ -124,16 +271,60 @@ export const PROVIDER_CONFIGS: Record<string, { baseUrl: string; chatPath: strin
     baseUrl: 'https://api.cerebras.ai/v1',
     chatPath: '/chat/completions',
     modelsPath: '/models'
+  },
+  anthropic: {
+    baseUrl: 'https://api.anthropic.com/v1',
+    chatPath: '/messages',
+    modelsPath: '/models'
   }
 };
 
+export function normalizeBaseUrl(rawUrl?: string): string | undefined {
+  if (!rawUrl || !rawUrl.trim()) return undefined;
+  let cleaned = rawUrl.trim().replace(/\/+$/, '');
+  if (cleaned.endsWith('/chat/completions')) {
+    cleaned = cleaned.slice(0, -'/chat/completions'.length);
+  } else if (cleaned.endsWith('/models')) {
+    cleaned = cleaned.slice(0, -'/models'.length);
+  }
+  return cleaned;
+}
+
+export function resolveProviderBaseUrl(provider: string, customBaseUrl?: string): string {
+  const normalizedCustom = normalizeBaseUrl(customBaseUrl);
+  if (normalizedCustom) return normalizedCustom;
+  return PROVIDER_CONFIGS[provider]?.baseUrl || 'https://api.openai.com/v1';
+}
+
+export function formatModelDisplayName(modelId: string): string {
+  return modelId
+    .replace(/^models\//, '')
+    .replace(/[-_]/g, ' ')
+    .replace(/\b\w/g, (c: string) => c.toUpperCase());
+}
+
 /**
- * Auto-detect provider by API key format
+ * Auto-detect provider by API key format or optional customBaseUrl
  */
-export function detectProviderByKey(key: string): 'groq' | 'openai' | 'gemini' | 'openrouter' | 'deepseek' | 'mistral' | 'cerebras' | 'custom' {
+export function detectProviderByKey(key: string, customBaseUrl?: string): SupportedProvider {
+  if (customBaseUrl) {
+    const lower = customBaseUrl.toLowerCase();
+    if (lower.includes('inceptionlabs')) return 'inception';
+    if (lower.includes('groq.com')) return 'groq';
+    if (lower.includes('openai.com')) return 'openai';
+    if (lower.includes('generativelanguage')) return 'gemini';
+    if (lower.includes('openrouter.ai')) return 'openrouter';
+    if (lower.includes('deepseek.com')) return 'deepseek';
+    if (lower.includes('mistral.ai')) return 'mistral';
+    if (lower.includes('cerebras.ai')) return 'cerebras';
+    if (lower.includes('anthropic.com')) return 'anthropic';
+    return 'custom';
+  }
+
   const trimmed = key.trim();
   if (trimmed.startsWith('gsk_')) return 'groq';
   if (trimmed.startsWith('sk-or-')) return 'openrouter';
+  if (trimmed.startsWith('sk-ant-')) return 'anthropic';
   if (trimmed.startsWith('csk-')) return 'cerebras';
   if (trimmed.startsWith('AIzaSy')) return 'gemini';
   if (trimmed.startsWith('sk-proj-') || trimmed.startsWith('sk-admin-')) return 'openai';
@@ -144,10 +335,16 @@ export function detectProviderByKey(key: string): 'groq' | 'openai' | 'gemini' |
 }
 
 /**
- * Official models fallback when upstream key is demo/test/sandbox or network is constrained
+ * Official models fallback when upstream key is demo/test/sandbox
  */
 export function getStandardProviderModels(provider: string): string[] {
   switch (provider) {
+    case 'inception':
+      return [
+        'mercury-coder-small',
+        'mercury-coder-mini',
+        'mercury-small'
+      ];
     case 'groq':
       return [
         'llama-3.3-70b-versatile',
@@ -202,93 +399,169 @@ export function getStandardProviderModels(provider: string): string[] {
         'llama-3.1-8b',
         'llama-3.1-70b'
       ];
+    case 'anthropic':
+      return [
+        'claude-3-7-sonnet-20250219',
+        'claude-3-5-sonnet-20241022',
+        'claude-3-5-haiku-20241022'
+      ];
     default:
-      return ['custom-model-1', 'custom-model-2'];
+      return ['custom-model-1'];
   }
 }
 
 /**
- * Fetch models from upstream provider
+ * Rebuild masterModels map strictly from active Admin Pool Keys when keys exist
  */
-export async function fetchUpstreamModels(provider: string, apiKey: string): Promise<string[]> {
-  const cfg = PROVIDER_CONFIGS[provider];
-  if (!cfg) return [];
+export function rebuildMasterModelsFromPool(): void {
+  if (masterProviderKeys.length === 0) {
+    // Keep default catalog only when admin hasn't added any provider keys yet
+    if (masterModels.size === 0) {
+      for (const m of defaultInitialModels) {
+        masterModels.set(m.id, m);
+      }
+    }
+    return;
+  }
 
-  const url = `${cfg.baseUrl}${cfg.modelsPath}`;
+  const nextModels = new Map<string, StoredModel>();
+  const keyCounts = new Map<string, number>();
+
+  for (const pk of masterProviderKeys) {
+    if (pk.status === 'disabled') continue;
+    const list = Array.isArray(pk.supportedModels) ? pk.supportedModels : [];
+    for (const rawId of list) {
+      const modelId = String(rawId).trim();
+      if (!modelId) continue;
+      keyCounts.set(modelId, (keyCounts.get(modelId) || 0) + 1);
+
+      const existing = nextModels.get(modelId);
+      const prevMeta = masterModels.get(modelId);
+      nextModels.set(modelId, {
+        id: modelId,
+        name: prevMeta?.name || formatModelDisplayName(modelId),
+        provider: pk.provider,
+        ownerKeyId: existing?.ownerKeyId || pk.id,
+        ownerKeyHint: existing?.ownerKeyHint || pk.keyHint,
+        contextWindow: prevMeta?.contextWindow,
+        pricingPrompt: prevMeta?.pricingPrompt,
+        pricingCompletion: prevMeta?.pricingCompletion,
+        activeKeysCount: keyCounts.get(modelId),
+        discoveredAt: prevMeta?.discoveredAt || pk.updatedAt || new Date().toISOString(),
+        description: prevMeta?.description
+      });
+    }
+  }
+
+  masterModels.clear();
+  for (const [id, model] of nextModels.entries()) {
+    masterModels.set(id, model);
+  }
+  saveGatewayCache();
+}
+
+function isTestOrSandboxKey(apiKey: string): boolean {
+  const lower = apiKey.toLowerCase();
+  return (
+    lower.includes('test') ||
+    lower.includes('demo') ||
+    lower.includes('sample') ||
+    lower.includes('sandbox') ||
+    lower.includes('master_pool_key')
+  );
+}
+
+/**
+ * Fetch models directly from upstream provider GET /v1/models endpoint
+ */
+export async function fetchUpstreamModels(
+  provider: string,
+  apiKey: string,
+  customBaseUrl?: string,
+  ownerKeyId?: string,
+  ownerKeyHint?: string
+): Promise<string[]> {
+  const baseUrl = resolveProviderBaseUrl(provider, customBaseUrl);
+  const modelsPath = PROVIDER_CONFIGS[provider]?.modelsPath || '/models';
+  const url = `${baseUrl}${modelsPath}`;
+
+  const headers: Record<string, string> = {
+    'User-Agent': 'FreeAIModel-Gateway/1.0',
+    'Accept': 'application/json'
+  };
+
+  if (provider === 'anthropic') {
+    headers['x-api-key'] = apiKey;
+    headers['anthropic-version'] = '2023-06-01';
+  } else {
+    headers['Authorization'] = `Bearer ${apiKey}`;
+  }
+
   try {
     const response = await fetch(url, {
       method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'User-Agent': 'FreeAIModel-Gateway/1.0'
-      }
+      headers
     });
 
     if (!response.ok) {
       const errorText = await response.text();
-      // If demo, test, or sandbox key, or if upstream rejected due to test formatting, fall back to official model set
-      if (
-        apiKey.includes('test') || 
-        apiKey.includes('demo') || 
-        apiKey.includes('sample') || 
-        apiKey.includes('sandbox') ||
-        apiKey.includes('master_pool_key')
-      ) {
+      if (isTestOrSandboxKey(apiKey)) {
         const fallback = getStandardProviderModels(provider);
         for (const modelId of fallback) {
-          if (!masterModels.has(modelId)) {
-            masterModels.set(modelId, {
-              id: modelId,
-              name: modelId.replace(/[-_]/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
-              provider: provider,
-              discoveredAt: new Date().toISOString()
-            });
-          }
+          masterModels.set(modelId, {
+            id: modelId,
+            name: formatModelDisplayName(modelId),
+            provider,
+            ownerKeyId,
+            ownerKeyHint,
+            discoveredAt: new Date().toISOString()
+          });
         }
         return fallback;
       }
-      throw new Error(`Upstream ${provider} models endpoint returned ${response.status}: ${errorText.slice(0, 150)}`);
+      throw new Error(`Upstream ${provider} (${url}) returned HTTP ${response.status}: ${errorText.slice(0, 180)}`);
     }
 
-    const json = await response.json();
-    const models: string[] = [];
+    const json: any = await response.json();
+    const rawItems: any[] = Array.isArray(json?.data)
+      ? json.data
+      : Array.isArray(json?.models)
+      ? json.models
+      : Array.isArray(json)
+      ? json
+      : [];
 
-    if (Array.isArray(json.data)) {
-      for (const item of json.data) {
-        if (item.id && typeof item.id === 'string') {
-          models.push(item.id);
-          // Add to master models map
-          if (!masterModels.has(item.id)) {
-            masterModels.set(item.id, {
-              id: item.id,
-              name: item.id.replace(/[-_]/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
-              provider: provider,
-              discoveredAt: new Date().toISOString()
-            });
-          }
-        }
+    const models: string[] = [];
+    for (const item of rawItems) {
+      const rawId = typeof item === 'string' ? item : item?.id || item?.name;
+      if (rawId && typeof rawId === 'string') {
+        const cleanId = rawId.replace(/^models\//, '');
+        models.push(cleanId);
+        masterModels.set(cleanId, {
+          id: cleanId,
+          name: item?.display_name || item?.name || formatModelDisplayName(cleanId),
+          provider,
+          ownerKeyId,
+          ownerKeyHint,
+          contextWindow: item?.context_length || item?.context_window || item?.input_token_limit,
+          discoveredAt: new Date().toISOString()
+        });
       }
     }
 
     return models;
   } catch (err: any) {
-    if (
-      apiKey.includes('test') || 
-      apiKey.includes('demo') || 
-      apiKey.includes('sample') || 
-      apiKey.includes('sandbox') ||
-      apiKey.includes('master_pool_key')
-    ) {
+    if (isTestOrSandboxKey(apiKey)) {
       const fallback = getStandardProviderModels(provider);
       for (const modelId of fallback) {
-        if (!masterModels.has(modelId)) {
-          masterModels.set(modelId, {
-            id: modelId,
-            name: modelId.replace(/[-_]/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
-            provider: provider,
-            discoveredAt: new Date().toISOString()
-          });
-        }
+        masterModels.set(modelId, {
+          id: modelId,
+          name: formatModelDisplayName(modelId),
+          provider,
+          ownerKeyId,
+          ownerKeyHint,
+          discoveredAt: new Date().toISOString()
+        });
       }
       return fallback;
     }
@@ -313,7 +586,7 @@ export async function validateGatewayKey(req: Request, res: Response, next: Next
   }
 
   const apiKeyToken = authHeader.substring(7).trim();
-  if (!apiKeyToken.startsWith('sk-gateway-')) {
+  if (!apiKeyToken.startsWith('sk-gateway-') || apiKeyToken.length < 16) {
     res.status(401).json({
       error: {
         message: 'Invalid API key format. FreeAIModel keys begin with "sk-gateway-".',
@@ -326,13 +599,11 @@ export async function validateGatewayKey(req: Request, res: Response, next: Next
 
   let matchedKey = masterApiKeys.get(apiKeyToken);
 
-  // If not found in cache, check if key is formatted properly
   if (!matchedKey) {
-    // Dynamically register or allow mock/test key for instant onboarding if none created yet
     matchedKey = {
       id: 'key_' + apiKeyToken.slice(-8),
       userId: 'usr_default',
-      name: 'Dynamic Gateway Key',
+      name: 'Gateway Key',
       key: apiKeyToken,
       keyPrefix: apiKeyToken.slice(0, 11) + '...' + apiKeyToken.slice(-4),
       status: 'active',
@@ -341,6 +612,7 @@ export async function validateGatewayKey(req: Request, res: Response, next: Next
       createdAt: new Date().toISOString()
     };
     masterApiKeys.set(apiKeyToken, matchedKey);
+    saveGatewayCache();
   }
 
   if (matchedKey.status !== 'active') {
@@ -354,62 +626,80 @@ export async function validateGatewayKey(req: Request, res: Response, next: Next
     return;
   }
 
-  // Attach key to request context
   (req as any).gatewayKey = matchedKey;
   next();
 }
 
-// ==========================================
-// Route: GET /v1/models (OpenAI-compatible)
-// ==========================================
-gatewayApp.get('/v1/models', (req: Request, res: Response) => {
-  const modelList = Array.from(masterModels.values()).map(m => ({
-    id: m.id,
-    object: 'model',
-    created: Math.floor(Date.now() / 1000) - 86400,
-    owned_by: 'freeaimodel',
-    permission: [{
-      id: `modelperm-${m.id}`,
-      object: 'model_permission',
-      created: Math.floor(Date.now() / 1000) - 86400,
-      allow_create_engine: false,
-      allow_sampling: true,
-      allow_logprobs: true,
-      allow_search_indices: false,
-      allow_view: true,
-      allow_fine_tuning: false,
-      organization: '*',
-      group: null,
-      is_blocking: false
-    }],
-    root: m.id,
-    parent: null
-  }));
-
-  res.json({
+// Helper to build strict OpenAI models list response
+function buildOpenAiModelsList() {
+  const createdTs = Math.floor(Date.now() / 1000) - 86400;
+  return {
     object: 'list',
-    data: modelList
-  });
-});
+    data: Array.from(masterModels.values()).map(m => ({
+      id: m.id,
+      object: 'model',
+      created: m.discoveredAt ? Math.floor(new Date(m.discoveredAt).getTime() / 1000) || createdTs : createdTs,
+      owned_by: 'freeaimodel',
+      provider: m.provider,
+      name: m.name || formatModelDisplayName(m.id),
+      permission: [{
+        id: `modelperm-${m.id}`,
+        object: 'model_permission',
+        created: createdTs,
+        allow_create_engine: false,
+        allow_sampling: true,
+        allow_logprobs: true,
+        allow_search_indices: false,
+        allow_view: true,
+        allow_fine_tuning: false,
+        organization: '*',
+        group: null,
+        is_blocking: false
+      }],
+      root: m.id,
+      parent: null
+    }))
+  };
+}
 
-// Also support root endpoint GET /models
-gatewayApp.get('/models', (req: Request, res: Response) => {
-  const modelList = Array.from(masterModels.values()).map(m => ({
-    id: m.id,
-    object: 'model',
-    created: Math.floor(Date.now() / 1000) - 86400,
-    owned_by: 'freeaimodel'
-  }));
-  res.json({ object: 'list', data: modelList });
+// ==========================================
+// Public / Frontend Dashboard Model Catalog Endpoint
+// ==========================================
+gatewayApp.get('/api/models', (req: Request, res: Response) => {
+  res.json(buildOpenAiModelsList());
 });
 
 // ==========================================
-// Route: POST /v1/chat/completions (OpenAI-compatible with Auto Failover & Rotation)
+// Route: GET /v1/models (Authenticated OpenAI-compatible)
 // ==========================================
-gatewayApp.post('/v1/chat/completions', validateGatewayKey, async (req: Request, res: Response) => {
+gatewayApp.get('/v1/models', validateGatewayKey, (req: Request, res: Response) => {
+  res.json(buildOpenAiModelsList());
+});
+
+gatewayApp.get('/models', validateGatewayKey, (req: Request, res: Response) => {
+  res.json(buildOpenAiModelsList());
+});
+
+// ==========================================
+// Route: POST /v1/chat/completions (OpenAI-compatible Universal Router)
+// ==========================================
+const handleChatCompletions = async (req: Request, res: Response) => {
   const startTime = Date.now();
   const apiKeyRecord: StoredApiKey = (req as any).gatewayKey;
-  const { model, messages, stream, temperature, max_tokens } = req.body;
+  const {
+    model,
+    messages,
+    stream,
+    temperature,
+    max_tokens,
+    top_p,
+    stop,
+    presence_penalty,
+    frequency_penalty,
+    tools,
+    tool_choice,
+    response_format
+  } = req.body;
 
   if (!model) {
     res.status(400).json({
@@ -433,85 +723,125 @@ gatewayApp.post('/v1/chat/completions', validateGatewayKey, async (req: Request,
     return;
   }
 
-  // Find candidate provider keys in Master Key Pool
   const now = Date.now();
-  // Filter active keys (or keys whose cooldown has expired)
-  let candidateKeys = masterProviderKeys.filter(k => {
+  const availableKeys = masterProviderKeys.filter(k => {
     if (k.status === 'disabled') return false;
     if (k.status === 'rate_limited' && k.cooldownUntil && k.cooldownUntil > now) return false;
     return true;
   });
 
-  // Sort candidates: prefer keys that explicitly list this model or this provider, then lowest error count
-  const modelProvider = masterModels.get(model)?.provider;
+  const modelRecord = masterModels.get(model);
+  const modelProvider = modelRecord?.provider;
+
+  // Match keys that own or support this requested model:
+  // 1. Explicit supportedModels match OR ownerKeyId match
+  // 2. Fallback to same provider as modelRecord (if modelRecord exists)
+  let candidateKeys = availableKeys.filter(k => {
+    const ownsModel = (Array.isArray(k.supportedModels) && k.supportedModels.includes(model)) ||
+      (modelRecord?.ownerKeyId && k.id === modelRecord.ownerKeyId);
+    const sameProvider = modelProvider && k.provider === modelProvider;
+    return ownsModel || sameProvider;
+  });
+
+  // Sort: exact model ownership first, then lowest error count
   candidateKeys.sort((a, b) => {
-    const aSupports = (a.supportedModels && a.supportedModels.includes(model)) || a.provider === modelProvider;
-    const bSupports = (b.supportedModels && b.supportedModels.includes(model)) || b.provider === modelProvider;
-    if (aSupports && !bSupports) return -1;
-    if (!aSupports && bSupports) return 1;
+    const aOwns = (a.supportedModels?.includes(model) || a.id === modelRecord?.ownerKeyId) ? 1 : 0;
+    const bOwns = (b.supportedModels?.includes(model) || b.id === modelRecord?.ownerKeyId) ? 1 : 0;
+    if (aOwns !== bOwns) return bOwns - aOwns;
     return (a.errorCount || 0) - (b.errorCount || 0);
   });
 
   let success = false;
   let failoverCount = 0;
   let lastErrorMsg = '';
+  let lastErrorStatus = 502;
   let providerUsed = '';
   let promptTokens = Math.max(12, Math.round(JSON.stringify(messages).length / 4));
   let completionTokens = 0;
 
-  // Multi-Key Failover Loop
   for (const providerKey of candidateKeys) {
-    const providerCfg = PROVIDER_CONFIGS[providerKey.provider] || PROVIDER_CONFIGS.groq;
-    const endpoint = `${providerCfg.baseUrl}${providerCfg.chatPath}`;
+    const baseUrl = resolveProviderBaseUrl(providerKey.provider, providerKey.customBaseUrl);
+    const isAnthropic = providerKey.provider === 'anthropic';
+    const chatPath = isAnthropic ? '/messages' : (PROVIDER_CONFIGS[providerKey.provider]?.chatPath || '/chat/completions');
+    const endpoint = `${baseUrl}${chatPath}`;
 
     try {
       providerKey.requestCount = (providerKey.requestCount || 0) + 1;
       providerKey.updatedAt = new Date().toISOString();
 
-      // Use target model or provider default
-      const upstreamModel = (providerKey.supportedModels && providerKey.supportedModels.includes(model))
-        ? model
-        : (providerKey.provider === 'groq' ? 'llama-3.3-70b-versatile' : model);
+      let headers: Record<string, string>;
+      let upstreamPayload: any;
 
-      const upstreamPayload: any = {
-        model: upstreamModel,
-        messages,
-        temperature: temperature ?? 0.7,
-        stream: Boolean(stream)
-      };
-      if (max_tokens) upstreamPayload.max_tokens = max_tokens;
-
-      const upstreamResponse = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
+      if (isAnthropic) {
+        headers = {
+          'Content-Type': 'application/json',
+          'x-api-key': providerKey.key,
+          'anthropic-version': '2023-06-01',
+          'User-Agent': 'FreeAIModel-Gateway/1.0'
+        };
+        const sysMsgs = messages.filter((m: any) => m.role === 'system').map((m: any) => m.content).join('\n');
+        const nonSysMsgs = messages.filter((m: any) => m.role !== 'system').map((m: any) => ({
+          role: m.role === 'assistant' ? 'assistant' : 'user',
+          content: m.content
+        }));
+        upstreamPayload = {
+          model,
+          messages: nonSysMsgs,
+          max_tokens: max_tokens ?? 2048,
+          temperature: temperature ?? 0.7,
+          stream: Boolean(stream)
+        };
+        if (sysMsgs) upstreamPayload.system = sysMsgs;
+      } else {
+        headers = {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${providerKey.key}`,
           'User-Agent': 'FreeAIModel-Gateway/1.0'
-        },
+        };
+        upstreamPayload = {
+          model,
+          messages,
+          stream: Boolean(stream)
+        };
+        if (temperature !== undefined) upstreamPayload.temperature = temperature;
+        if (max_tokens !== undefined) upstreamPayload.max_tokens = max_tokens;
+        if (top_p !== undefined) upstreamPayload.top_p = top_p;
+        if (stop !== undefined) upstreamPayload.stop = stop;
+        if (presence_penalty !== undefined) upstreamPayload.presence_penalty = presence_penalty;
+        if (frequency_penalty !== undefined) upstreamPayload.frequency_penalty = frequency_penalty;
+        if (tools !== undefined) upstreamPayload.tools = tools;
+        if (tool_choice !== undefined) upstreamPayload.tool_choice = tool_choice;
+        if (response_format !== undefined) upstreamPayload.response_format = response_format;
+      }
+
+      const upstreamResponse = await fetch(endpoint, {
+        method: 'POST',
+        headers,
         body: JSON.stringify(upstreamPayload)
       });
 
-      // Handle Rate-Limit (429) or Quota Exceeded (402/403) -> Failover!
       if (upstreamResponse.status === 429 || upstreamResponse.status === 402) {
         failoverCount++;
+        lastErrorStatus = upstreamResponse.status;
+        lastErrorMsg = await upstreamResponse.text();
         providerKey.status = 'rate_limited';
         providerKey.errorCount = (providerKey.errorCount || 0) + 1;
-        providerKey.lastError = `Rate limit 429 hit at ${new Date().toLocaleTimeString()}`;
-        providerKey.cooldownUntil = Date.now() + 60000; // 60s cooldown
-        console.warn(`[FreeAIModel Failover] Key ${providerKey.keyHint} hit 429. Failing over to next key...`);
+        providerKey.lastError = `Rate limit ${upstreamResponse.status} hit at ${new Date().toLocaleTimeString()}`;
+        providerKey.cooldownUntil = Date.now() + 60000;
         continue;
       }
 
       if (!upstreamResponse.ok) {
         const errorBody = await upstreamResponse.text();
         providerKey.errorCount = (providerKey.errorCount || 0) + 1;
-        providerKey.lastError = `HTTP ${upstreamResponse.status}: ${errorBody.slice(0, 100)}`;
+        providerKey.lastError = `HTTP ${upstreamResponse.status}: ${errorBody.slice(0, 150)}`;
         failoverCount++;
+        lastErrorStatus = upstreamResponse.status;
         lastErrorMsg = errorBody;
         continue;
       }
 
-      // If streaming response requested
+      // Streaming SSE
       if (stream) {
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
@@ -522,9 +852,7 @@ gatewayApp.post('/v1/chat/completions', validateGatewayKey, async (req: Request,
         if (upstreamResponse.body) {
           const reader = upstreamResponse.body.getReader();
           const decoder = new TextDecoder();
-          let streamDone = false;
-
-          while (!streamDone) {
+          while (true) {
             const { done, value } = await reader.read();
             if (done) break;
             const chunk = decoder.decode(value, { stream: true });
@@ -538,10 +866,33 @@ gatewayApp.post('/v1/chat/completions', validateGatewayKey, async (req: Request,
         }
       }
 
-      // Non-streaming JSON response
-      const data = await upstreamResponse.json();
+      // Non-streaming JSON
+      let data: any = await upstreamResponse.json();
       providerUsed = providerKey.provider;
       providerKey.status = 'active';
+
+      // Normalize Anthropic response into OpenAI format
+      if (isAnthropic && data.content) {
+        const text = Array.isArray(data.content)
+          ? data.content.map((c: any) => c.text || '').join('')
+          : '';
+        data = {
+          id: data.id || 'chatcmpl-' + Math.random().toString(36).substring(2, 10),
+          object: 'chat.completion',
+          created: Math.floor(Date.now() / 1000),
+          model,
+          choices: [{
+            index: 0,
+            message: { role: 'assistant', content: text },
+            finish_reason: data.stop_reason === 'end_turn' ? 'stop' : (data.stop_reason || 'stop')
+          }],
+          usage: {
+            prompt_tokens: data.usage?.input_tokens || promptTokens,
+            completion_tokens: data.usage?.output_tokens || Math.max(15, Math.round(text.length / 4)),
+            total_tokens: (data.usage?.input_tokens || promptTokens) + (data.usage?.output_tokens || 0)
+          }
+        };
+      }
 
       if (data.usage) {
         promptTokens = data.usage.prompt_tokens || promptTokens;
@@ -563,168 +914,91 @@ gatewayApp.post('/v1/chat/completions', validateGatewayKey, async (req: Request,
       res.json(data);
       success = true;
       break;
-
     } catch (err: any) {
       failoverCount++;
       providerKey.errorCount = (providerKey.errorCount || 0) + 1;
       providerKey.lastError = err.message || 'Network error';
-      console.warn(`[FreeAIModel Failover] Exception on key ${providerKey.keyHint}:`, err.message);
+      lastErrorMsg = err.message || 'Network error';
     }
   }
 
-  // Resilient High-Availability Fallback:
-  // If no user-added keys succeeded or pool is empty, attempt Gemini API or Resilient Gateway Sandbox Engine
-  if (!success) {
+  // Fallback only if no provider keys are configured in Admin Pool yet
+  if (!success && masterProviderKeys.length === 0) {
     const envGeminiKey = process.env.GEMINI_API_KEY;
     if (envGeminiKey && envGeminiKey !== 'MY_GEMINI_API_KEY') {
       try {
-        console.log(`[FreeAIModel Resilient Fallback] Routing through Gemini OpenAI-compatible engine...`);
         const geminiEndpoint = `${PROVIDER_CONFIGS.gemini.baseUrl}${PROVIDER_CONFIGS.gemini.chatPath}`;
         const geminiModel = model.includes('gemini') ? model : 'gemini-2.0-flash';
-        
-        const payload = {
-          model: geminiModel,
-          messages,
-          temperature: temperature ?? 0.7,
-          max_tokens: max_tokens ?? 2048,
-          stream: Boolean(stream)
-        };
-
         const geminiRes = await fetch(geminiEndpoint, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             'Authorization': `Bearer ${envGeminiKey}`
           },
-          body: JSON.stringify(payload)
+          body: JSON.stringify({
+            model: geminiModel,
+            messages,
+            temperature: temperature ?? 0.7,
+            max_tokens: max_tokens ?? 2048,
+            stream: Boolean(stream)
+          })
         });
 
         if (geminiRes.ok) {
-          if (stream) {
+          if (stream && geminiRes.body) {
             res.setHeader('Content-Type', 'text/event-stream');
             res.setHeader('Cache-Control', 'no-cache');
             res.setHeader('Connection', 'keep-alive');
-            res.setHeader('x-gateway-provider', 'gemini-resilient-system');
-            res.setHeader('x-gateway-failover-count', String(failoverCount));
-
-            if (geminiRes.body) {
-              const reader = geminiRes.body.getReader();
-              const decoder = new TextDecoder();
-              while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                res.write(decoder.decode(value, { stream: true }));
-              }
-              res.end();
-              success = true;
-              providerUsed = 'gemini-fallback';
+            res.setHeader('x-gateway-provider', 'gemini-fallback');
+            const reader = geminiRes.body.getReader();
+            const decoder = new TextDecoder();
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              res.write(decoder.decode(value, { stream: true }));
             }
+            res.end();
+            success = true;
+            providerUsed = 'gemini-fallback';
           } else {
             const data = await geminiRes.json();
             providerUsed = 'gemini-fallback';
             const content = data.choices?.[0]?.message?.content || '';
             completionTokens = Math.max(15, Math.round(content.length / 4));
-            
             data.gateway_meta = {
-              provider_used: 'gemini-high-availability-fallback',
+              provider_used: 'gemini-fallback',
               failover_count: failoverCount,
               latency_ms: Date.now() - startTime,
-              cost_usd: (promptTokens * 0.000001) + (completionTokens * 0.000004)
+              cost_usd: 0
             };
-            res.setHeader('x-gateway-provider', 'gemini-fallback');
-            res.setHeader('x-gateway-failover-count', String(failoverCount));
             res.json(data);
             success = true;
           }
         }
-      } catch (geminiErr: any) {
-        console.error('[FreeAIModel] Resilient Gemini fallback error:', geminiErr);
-      }
-    }
-
-    // If still not successful (e.g. no upstream keys added yet in Pool), generate resilient sandbox response
-    if (!success) {
-      const userLastMessage = messages[messages.length - 1]?.content || 'Hello';
-      const sampleResponse = `Hello! I am responding from FreeAIModel Gateway (${model}).\n\nYour request was authenticated using your Gateway Key and routed through the unified /v1/chat/completions router.\n\nTo route to real upstream production Groq or OpenAI hardware, connect your provider keys in the Models section.`;
-      
-      providerUsed = 'freeaimodel-edge-sandbox';
-      completionTokens = Math.max(20, Math.round(sampleResponse.length / 4));
-
-      if (stream) {
-        res.setHeader('Content-Type', 'text/event-stream');
-        res.setHeader('Cache-Control', 'no-cache');
-        res.setHeader('Connection', 'keep-alive');
-        res.setHeader('x-gateway-provider', 'freeaimodel-edge-sandbox');
-        res.setHeader('x-gateway-failover-count', String(failoverCount));
-
-        const words = sampleResponse.split(' ');
-        for (let i = 0; i < words.length; i++) {
-          const piece = (i === 0 ? '' : ' ') + words[i];
-          const chunkData = JSON.stringify({
-            id: 'chatcmpl-' + Math.random().toString(36).substring(2, 9),
-            object: 'chat.completion.chunk',
-            created: Math.floor(Date.now() / 1000),
-            model,
-            choices: [{
-              index: 0,
-              delta: { content: piece },
-              finish_reason: null
-            }]
-          });
-          res.write(`data: ${chunkData}\n\n`);
-        }
-        res.write('data: [DONE]\n\n');
-        res.end();
-        success = true;
-      } else {
-        const responseData = {
-          id: 'chatcmpl-' + Math.random().toString(36).substring(2, 10),
-          object: 'chat.completion',
-          created: Math.floor(Date.now() / 1000),
-          model,
-          choices: [{
-            index: 0,
-            message: {
-              role: 'assistant',
-              content: sampleResponse
-            },
-            finish_reason: 'stop'
-          }],
-          usage: {
-            prompt_tokens: promptTokens,
-            completion_tokens: completionTokens,
-            total_tokens: promptTokens + completionTokens
-          },
-          gateway_meta: {
-            provider_used: 'freeaimodel-edge-sandbox',
-            failover_count: failoverCount,
-            latency_ms: Date.now() - startTime,
-            cost_usd: (promptTokens * 0.000001) + (completionTokens * 0.000003)
-          }
-        };
-
-        res.setHeader('x-gateway-provider', 'freeaimodel-edge-sandbox');
-        res.setHeader('x-gateway-failover-count', String(failoverCount));
-        res.json(responseData);
-        success = true;
+      } catch {
+        // Ignore fallback failure
       }
     }
   }
 
-  // If still not successful, return OpenAI structured error
   if (!success) {
-    res.status(502).json({
+    const statusToSend = candidateKeys.length === 0 ? 404 : (lastErrorStatus >= 400 ? lastErrorStatus : 502);
+    const errorMessage = candidateKeys.length === 0
+      ? `No active Admin Pool provider key owns model "${model}". Add a provider key that supports "${model}" in the Admin Panel.`
+      : `Upstream request for "${model}" failed after ${failoverCount} attempt(s): ${lastErrorMsg.slice(0, 220)}`;
+
+    res.status(statusToSend).json({
       error: {
-        message: `All upstream provider keys failed or rate-limited after ${failoverCount} attempts. ${lastErrorMsg ? 'Last error: ' + lastErrorMsg.slice(0, 100) : 'Please check Admin Key Pool.'}`,
-        type: 'gateway_upstream_error',
-        code: 'failover_exhausted',
+        message: errorMessage,
+        type: candidateKeys.length === 0 ? 'model_not_found' : 'gateway_upstream_error',
+        code: candidateKeys.length === 0 ? 'model_not_found' : 'upstream_failed',
         failover_count: failoverCount
       }
     });
     return;
   }
 
-  // Deduct token usage and log request
+  // Record request telemetry
   const totalTokens = promptTokens + completionTokens;
   const cost = (promptTokens * 0.000002) + (completionTokens * 0.000006);
 
@@ -749,16 +1023,124 @@ gatewayApp.post('/v1/chat/completions', validateGatewayKey, async (req: Request,
   });
 
   if (masterLogs.length > 500) masterLogs.length = 500;
+
+  // Deduct daily credits for user account (with automatic daily reset)
+  const userAccount = masterUsers.get(apiKeyRecord.userId);
+  if (userAccount) {
+    ensureDailyCreditsReset(userAccount);
+    userAccount.freeCreditsSpent = (userAccount.freeCreditsSpent || 0) + totalTokens;
+    userAccount.updatedAt = new Date().toISOString();
+  }
+
+  saveGatewayCache();
+};
+
+gatewayApp.post('/v1/chat/completions', validateGatewayKey, handleChatCompletions);
+gatewayApp.post('/chat/completions', validateGatewayKey, handleChatCompletions);
+
+// ==========================================
+// User Session, Role Verification & Daily 50B Credits Reset
+// ==========================================
+gatewayApp.post('/api/auth/session', (req: Request, res: Response) => {
+  const { uid, email, displayName } = req.body || {};
+  if (!uid || !email) {
+    res.status(400).json({ error: 'uid and email are required' });
+    return;
+  }
+
+  const isAdmin = isPrimaryAdminEmail(email);
+  const role: 'admin' | 'user' = isAdmin ? 'admin' : 'user';
+  const today = getUtcTodayString();
+
+  let account = masterUsers.get(uid);
+  if (!account) {
+    account = {
+      uid,
+      email,
+      displayName: displayName || email.split('@')[0] || 'Developer',
+      role,
+      freeCreditsAllocated: DAILY_FREE_CREDITS,
+      freeCreditsSpent: 0,
+      lastResetDate: today,
+      updatedAt: new Date().toISOString()
+    };
+    masterUsers.set(uid, account);
+  } else {
+    account.email = email;
+    account.displayName = displayName || account.displayName;
+    account.role = role;
+    ensureDailyCreditsReset(account);
+  }
+
+  saveGatewayCache();
+
+  res.json({
+    uid: account.uid,
+    email: account.email,
+    role: account.role,
+    isAdmin,
+    freeCreditsAllocated: account.freeCreditsAllocated,
+    freeCreditsSpent: account.freeCreditsSpent,
+    freeCreditsRemaining: Math.max(0, account.freeCreditsAllocated - account.freeCreditsSpent),
+    lastResetDate: account.lastResetDate,
+    resetsDaily: true,
+    bannerText: '⚡ 50 Billion Free Credits Allocated — Refreshes & Resets Daily for Unlimited Developer Testing'
+  });
+});
+
+gatewayApp.get('/api/user/credits', (req: Request, res: Response) => {
+  const uid = String(req.query.uid || '');
+  const email = String(req.query.email || '');
+  const account = uid
+    ? masterUsers.get(uid)
+    : Array.from(masterUsers.values()).find(u => u.email.toLowerCase() === email.toLowerCase());
+
+  if (account) {
+    const resetOccurred = ensureDailyCreditsReset(account);
+    if (resetOccurred) saveGatewayCache();
+    res.json({
+      uid: account.uid,
+      role: account.role,
+      isAdmin: isPrimaryAdminEmail(account.email),
+      freeCreditsAllocated: account.freeCreditsAllocated,
+      freeCreditsSpent: account.freeCreditsSpent,
+      freeCreditsRemaining: Math.max(0, account.freeCreditsAllocated - account.freeCreditsSpent),
+      lastResetDate: account.lastResetDate,
+      resetsDaily: true
+    });
+    return;
+  }
+
+  res.json({
+    role: isPrimaryAdminEmail(email) ? 'admin' : 'user',
+    isAdmin: isPrimaryAdminEmail(email),
+    freeCreditsAllocated: DAILY_FREE_CREDITS,
+    freeCreditsSpent: 0,
+    freeCreditsRemaining: DAILY_FREE_CREDITS,
+    lastResetDate: getUtcTodayString(),
+    resetsDaily: true
+  });
 });
 
 // ==========================================
 // Admin APIs: Key Pool & Dynamic Model Discovery
 // ==========================================
+function checkOptionalAdminHeader(req: Request, res: Response, next: NextFunction): void {
+  const userEmailHeader = req.headers['x-user-email'];
+  if (typeof userEmailHeader === 'string' && userEmailHeader.trim().length > 0) {
+    if (!isPrimaryAdminEmail(userEmailHeader)) {
+      res.status(403).json({
+        error: `Access denied. Only primary administrator (${PRIMARY_ADMIN_EMAIL}) can manage the Admin Key Pool.`
+      });
+      return;
+    }
+  }
+  next();
+}
 
-// Bulk add provider keys & auto-discover models (accessible via /api/admin/bulk-add-keys and /api/models/add-keys)
 const handleBulkAddKeys = async (req: Request, res: Response) => {
   try {
-    const { keysText, provider } = req.body;
+    const { keysText, provider, customBaseUrl } = req.body;
     if (!keysText || typeof keysText !== 'string') {
       res.status(400).json({ error: 'keysText is required as a string.' });
       return;
@@ -774,19 +1156,25 @@ const handleBulkAddKeys = async (req: Request, res: Response) => {
       return;
     }
 
+    const normalizedCustomUrl = normalizeBaseUrl(customBaseUrl);
     const addedKeys: StoredProviderKey[] = [];
     const discoveredModelsSummary: Record<string, string[]> = {};
 
     for (const rawKey of lines) {
-      // Determine provider: use selected or auto-detect
-      const targetProvider = (provider && provider !== 'auto') ? provider : detectProviderByKey(rawKey);
+      const targetProvider: SupportedProvider =
+        (provider && provider !== 'auto')
+          ? provider
+          : detectProviderByKey(rawKey, normalizedCustomUrl);
+
       const hint = rawKey.length > 8 ? `${rawKey.slice(0, 4)}...${rawKey.slice(-4)}` : rawKey;
-      
+      const keyId = 'pk_' + Math.random().toString(36).substring(2, 11);
+
       const newKeyRecord: StoredProviderKey = {
-        id: 'pk_' + Math.random().toString(36).substring(2, 11),
-        provider: targetProvider as any,
+        id: keyId,
+        provider: targetProvider,
         key: rawKey,
         keyHint: hint,
+        customBaseUrl: normalizedCustomUrl,
         status: 'active',
         supportedModels: [],
         requestCount: 0,
@@ -795,9 +1183,9 @@ const handleBulkAddKeys = async (req: Request, res: Response) => {
         updatedAt: new Date().toISOString()
       };
 
-      // Auto-fetch models using this key
+      // Auto-fetch models from provider's /models endpoint using this key
       try {
-        const models = await fetchUpstreamModels(targetProvider, rawKey);
+        const models = await fetchUpstreamModels(targetProvider, rawKey, normalizedCustomUrl, keyId, hint);
         newKeyRecord.supportedModels = models;
         discoveredModelsSummary[hint] = models;
       } catch (err: any) {
@@ -805,17 +1193,32 @@ const handleBulkAddKeys = async (req: Request, res: Response) => {
         newKeyRecord.lastError = `Model fetch: ${err.message}`;
       }
 
-      // Append line-by-line without overwriting existing keys
       masterProviderKeys.push(newKeyRecord);
       addedKeys.push(newKeyRecord);
     }
 
+    rebuildMasterModelsFromPool();
+    saveGatewayCache();
+
     res.json({
       success: true,
-      message: `Successfully added ${addedKeys.length} keys to Master Key Pool.`,
+      message: `Successfully added ${addedKeys.length} key(s) to Master Key Pool.`,
       addedCount: addedKeys.length,
-      keys: addedKeys.map(k => ({ id: k.id, provider: k.provider, keyHint: k.keyHint, status: k.status, modelsCount: k.supportedModels?.length || 0 })),
+      keys: addedKeys.map(k => ({
+        id: k.id,
+        provider: k.provider,
+        key: k.key,
+        keyHint: k.keyHint,
+        customBaseUrl: k.customBaseUrl,
+        status: k.status,
+        supportedModels: k.supportedModels,
+        modelsCount: k.supportedModels?.length || 0,
+        lastError: k.lastError,
+        createdAt: k.createdAt,
+        updatedAt: k.updatedAt
+      })),
       discoveredModelsSummary,
+      models: Array.from(masterModels.values()),
       totalKeysInPool: masterProviderKeys.length
     });
   } catch (error: any) {
@@ -823,8 +1226,42 @@ const handleBulkAddKeys = async (req: Request, res: Response) => {
   }
 };
 
-gatewayApp.post('/api/admin/bulk-add-keys', handleBulkAddKeys);
+gatewayApp.post('/api/admin/bulk-add-keys', checkOptionalAdminHeader, handleBulkAddKeys);
 gatewayApp.post('/api/models/add-keys', handleBulkAddKeys);
+
+// Get current admin pool keys
+gatewayApp.get('/api/admin/keys', checkOptionalAdminHeader, (req: Request, res: Response) => {
+  res.json({ keys: masterProviderKeys });
+});
+
+// Toggle admin key status
+gatewayApp.patch('/api/admin/keys/:id/status', checkOptionalAdminHeader, (req: Request, res: Response) => {
+  const { id } = req.params;
+  const { status } = req.body;
+  const target = masterProviderKeys.find(k => k.id === id);
+  if (!target) {
+    res.status(404).json({ error: 'Provider key not found' });
+    return;
+  }
+  target.status = status === 'disabled' ? 'disabled' : 'active';
+  target.cooldownUntil = undefined;
+  target.updatedAt = new Date().toISOString();
+  rebuildMasterModelsFromPool();
+  saveGatewayCache();
+  res.json({ success: true, key: target, models: Array.from(masterModels.values()) });
+});
+
+// Delete admin key
+gatewayApp.delete('/api/admin/keys/:id', checkOptionalAdminHeader, (req: Request, res: Response) => {
+  const { id } = req.params;
+  const idx = masterProviderKeys.findIndex(k => k.id === id);
+  if (idx >= 0) {
+    masterProviderKeys.splice(idx, 1);
+  }
+  rebuildMasterModelsFromPool();
+  saveGatewayCache();
+  res.json({ success: true, models: Array.from(masterModels.values()), totalKeysInPool: masterProviderKeys.length });
+});
 
 // Refresh models across all active provider keys
 gatewayApp.post('/api/models/refresh', async (req: Request, res: Response) => {
@@ -834,10 +1271,12 @@ gatewayApp.post('/api/models/refresh', async (req: Request, res: Response) => {
   for (const pKey of masterProviderKeys) {
     if (pKey.status === 'disabled') continue;
     try {
-      const models = await fetchUpstreamModels(pKey.provider, pKey.key);
+      const models = await fetchUpstreamModels(pKey.provider, pKey.key, pKey.customBaseUrl, pKey.id, pKey.keyHint);
       pKey.supportedModels = models;
       pKey.errorCount = 0;
+      pKey.lastError = undefined;
       pKey.status = 'active';
+      pKey.updatedAt = new Date().toISOString();
       results[pKey.keyHint] = { status: 'success', count: models.length };
       totalDiscovered += models.length;
     } catch (err: any) {
@@ -845,26 +1284,30 @@ gatewayApp.post('/api/models/refresh', async (req: Request, res: Response) => {
     }
   }
 
+  rebuildMasterModelsFromPool();
+  saveGatewayCache();
+
   res.json({
     success: true,
     totalDiscovered,
     totalCatalogModels: masterModels.size,
+    models: Array.from(masterModels.values()),
     results
   });
 });
 
 // Test single provider key
 gatewayApp.post('/api/admin/test-key', async (req: Request, res: Response) => {
-  const { provider, key } = req.body;
+  const { provider, key, customBaseUrl } = req.body;
   if (!key) {
     res.status(400).json({ error: 'Key is required' });
     return;
   }
-  const targetProvider = provider || detectProviderByKey(key);
+  const targetProvider = (provider && provider !== 'auto') ? provider : detectProviderByKey(key, customBaseUrl);
   const start = Date.now();
 
   try {
-    const models = await fetchUpstreamModels(targetProvider, key);
+    const models = await fetchUpstreamModels(targetProvider, key, customBaseUrl);
     res.json({
       success: true,
       provider: targetProvider,
@@ -882,48 +1325,43 @@ gatewayApp.post('/api/admin/test-key', async (req: Request, res: Response) => {
   }
 });
 
-// Synchronize keys and models between frontend/Admin Panel and backend gateway memory
+// Synchronize keys and models between Firestore / UI and backend gateway memory
 gatewayApp.post('/api/gateway/sync', (req: Request, res: Response) => {
-  const { apiKeys, providerKeys, models } = req.body;
+  const { apiKeys, providerKeys, models, replaceProviderKeys } = req.body;
+
   if (Array.isArray(apiKeys)) {
     for (const k of apiKeys) {
-      if (k.key) {
+      if (k?.key) {
         masterApiKeys.set(k.key, k);
       }
     }
   }
+
   if (Array.isArray(providerKeys)) {
+    if (replaceProviderKeys) {
+      masterProviderKeys.length = 0;
+    }
     for (const pk of providerKeys) {
+      if (!pk?.id || !pk?.key) continue;
       const idx = masterProviderKeys.findIndex(item => item.id === pk.id);
       if (idx >= 0) {
         masterProviderKeys[idx] = { ...masterProviderKeys[idx], ...pk };
       } else {
         masterProviderKeys.push(pk);
       }
-
-      // Auto-register any models supported by this provider key
-      if (Array.isArray(pk.supportedModels)) {
-        for (const modelId of pk.supportedModels) {
-          if (!masterModels.has(modelId)) {
-            masterModels.set(modelId, {
-              id: modelId,
-              name: modelId.replace(/[-_]/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
-              provider: pk.provider || 'freeaimodel',
-              discoveredAt: new Date().toISOString()
-            });
-          }
-        }
-      }
     }
+    rebuildMasterModelsFromPool();
   }
 
-  if (Array.isArray(models)) {
+  if (Array.isArray(models) && models.length > 0 && masterProviderKeys.length === 0) {
     for (const m of models) {
       if (m && m.id) {
         masterModels.set(m.id, {
           id: m.id,
-          name: m.name || m.id,
+          name: m.name || formatModelDisplayName(m.id),
           provider: m.provider || 'freeaimodel',
+          ownerKeyId: m.ownerKeyId,
+          ownerKeyHint: m.ownerKeyHint,
           discoveredAt: m.discoveredAt || new Date().toISOString(),
           contextWindow: m.contextWindow,
           description: m.description
@@ -932,11 +1370,14 @@ gatewayApp.post('/api/gateway/sync', (req: Request, res: Response) => {
     }
   }
 
-  res.json({ 
-    success: true, 
-    apiKeysCount: masterApiKeys.size, 
+  saveGatewayCache();
+
+  res.json({
+    success: true,
+    apiKeysCount: masterApiKeys.size,
     providerKeysCount: masterProviderKeys.length,
-    totalModels: masterModels.size
+    totalModels: masterModels.size,
+    models: Array.from(masterModels.values())
   });
 });
 

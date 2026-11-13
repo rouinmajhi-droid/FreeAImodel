@@ -34,13 +34,15 @@ export interface ApiKey {
 }
 
 export type ProviderType = 
+  | 'inception'
   | 'groq' 
   | 'openai' 
   | 'gemini' 
   | 'openrouter' 
   | 'deepseek' 
   | 'mistral' 
-  | 'cerebras' 
+  | 'cerebras'
+  | 'anthropic'
   | 'custom';
 
 export type ProviderKeyStatus = 'active' | 'rate_limited' | 'exhausted' | 'disabled';
@@ -50,6 +52,7 @@ export interface ProviderKey {
   provider: ProviderType;
   key: string;
   keyHint: string; // e.g. gsk_...89ab
+  customBaseUrl?: string;
   status: ProviderKeyStatus;
   supportedModels?: string[];
   requestCount: number;
@@ -64,6 +67,8 @@ export interface GatewayModel {
   id: string;
   name: string;
   provider: ProviderType;
+  ownerKeyId?: string;
+  ownerKeyHint?: string;
   contextWindow?: number;
   pricingPrompt?: number; // per 1k tokens in USD
   pricingCompletion?: number; // per 1k tokens in USD
