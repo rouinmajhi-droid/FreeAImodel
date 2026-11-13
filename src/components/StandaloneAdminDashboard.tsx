@@ -128,6 +128,30 @@ export const StandaloneAdminDashboard: React.FC<StandaloneAdminDashboardProps> =
     e.preventDefault();
     if (!bulkKeysText.trim()) return;
 
+    const lines = bulkKeysText
+      .split(/[\r\n,]+/)
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0 && !l.startsWith('#'));
+
+    for (const line of lines) {
+      if (line.includes('…') || line.includes('...') || line.includes('•')) {
+        showToast(
+          'Masked Key Detected',
+          'Masked key detected, please paste the full raw API key',
+          'error'
+        );
+        return;
+      }
+      if (/[^\x21-\x7E]/.test(line)) {
+        showToast(
+          'Invalid Characters',
+          'API keys must contain valid ASCII characters only. Please paste the full raw API key.',
+          'error'
+        );
+        return;
+      }
+    }
+
     setIsSubmitting(true);
     try {
       const res = await onAddBulkKeys(bulkKeysText, selectedProvider, customBaseUrl.trim() || undefined);

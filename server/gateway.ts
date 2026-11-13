@@ -1,5 +1,4 @@
 import express, { Request, Response, NextFunction } from 'express';
-import cors from 'cors';
 import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
@@ -7,7 +6,21 @@ import path from 'path';
 dotenv.config();
 
 export const gatewayApp = express();
-gatewayApp.use(cors());
+
+// ==========================================
+// Explicit CORS & Preflight Headers for all gateway routes
+// ==========================================
+gatewayApp.use((req: Request, res: Response, next: NextFunction) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key, x-user-email');
+  if (req.method === 'OPTIONS') {
+    res.status(204).end();
+    return;
+  }
+  next();
+});
+
 gatewayApp.use(express.json({ limit: '10mb' }));
 
 export type SupportedProvider =
@@ -345,6 +358,17 @@ export function rebuildMasterModelsFromPool(): void {
   saveGatewayCache();
 }
 
+export function isMaskedOrInvalidHeaderKey(rawKey: string): string | null {
+  const trimmed = rawKey.trim();
+  if (trimmed.includes('…') || trimmed.includes('...') || trimmed.includes('•')) {
+    return 'Masked key detected, please paste the full raw API key';
+  }
+  if (/[^\x21-\x7E]/.test(trimmed)) {
+    return 'Invalid non-ASCII or whitespace characters detected in API key. Please paste the full raw ASCII API key.';
+  }
+  return null;
+}
+
 /**
  * Fetch real live models directly from upstream provider GET /v1/models endpoint
  */
@@ -356,6 +380,12 @@ export async function fetchUpstreamModels(
   ownerKeyHint?: string,
   mutateCatalog = true
 ): Promise<string[]> {
+  const cleanKey = apiKey.trim();
+  const keyValidationError = isMaskedOrInvalidHeaderKey(cleanKey);
+  if (keyValidationError) {
+    throw new Error(keyValidationError);
+  }
+
   const baseUrl = resolveProviderBaseUrl(provider, customBaseUrl);
   const modelsPath = PROVIDER_CONFIGS[provider]?.modelsPath || '/models';
   const url = `${baseUrl}${modelsPath}`;
@@ -366,10 +396,10 @@ export async function fetchUpstreamModels(
   };
 
   if (provider === 'anthropic') {
-    headers['x-api-key'] = apiKey;
+    headers['x-api-key'] = cleanKey;
     headers['anthropic-version'] = '2023-06-01';
   } else {
-    headers['Authorization'] = `Bearer ${apiKey}`;
+    headers['Authorization'] = `Bearer ${cleanKey}`;
   }
 
   const response = await fetch(url, {
@@ -421,15 +451,33 @@ export async function fetchUpstreamModels(
   return models;
 }
 
+function extractGatewayTokenFromRequest(req: Request): string | null {
+  const authHeader = req.headers['authorization'];
+  if (typeof authHeader === 'string' && authHeader.trim().length > 0) {
+    return authHeader.startsWith('Bearer ')
+      ? authHeader.substring(7).trim()
+      : authHeader.trim();
+  }
+  const xApiKey = req.headers['x-api-key'];
+  if (typeof xApiKey === 'string' && xApiKey.trim().length > 0) {
+    return xApiKey.trim();
+  }
+  const queryKey = req.query.key || req.query.api_key;
+  if (typeof queryKey === 'string' && queryKey.trim().length > 0) {
+    return queryKey.trim();
+  }
+  return null;
+}
+
 // ==========================================
-// Middleware: User Gateway API Key Validation
+// Middleware: Strict User Gateway API Key Validation (POST /v1/chat/completions)
 // ==========================================
 export async function validateGatewayKey(req: Request, res: Response, next: NextFunction): Promise<void> {
-  const authHeader = req.headers['authorization'];
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+  const apiKeyToken = extractGatewayTokenFromRequest(req);
+  if (!apiKeyToken) {
     res.status(401).json({
       error: {
-        message: 'Missing or malformed Authorization header. Expected "Authorization: Bearer sk-gateway-..."',
+        message: 'Missing Authorization key. Expected "Authorization: Bearer sk-gateway-..."',
         type: 'invalid_request_error',
         code: 'missing_api_key'
       }
@@ -437,7 +485,6 @@ export async function validateGatewayKey(req: Request, res: Response, next: Next
     return;
   }
 
-  const apiKeyToken = authHeader.substring(7).trim();
   if (!apiKeyToken.startsWith('sk-gateway-') || apiKeyToken.length < 16) {
     res.status(401).json({
       error: {
@@ -482,6 +529,33 @@ export async function validateGatewayKey(req: Request, res: Response, next: Next
   next();
 }
 
+// ==========================================
+// Middleware: Flexible Optional Auth for Model Listing (GET /v1/models & GET /models)
+// Accepts Bearer token, x-api-key, ?key= query param, or unauthenticated public discovery
+// ==========================================
+export function optionalFlexibleGatewayAuth(req: Request, _res: Response, next: NextFunction): void {
+  const apiKeyToken = extractGatewayTokenFromRequest(req);
+  if (apiKeyToken) {
+    const existing = masterApiKeys.get(apiKeyToken);
+    if (existing) {
+      (req as any).gatewayKey = existing;
+    } else if (apiKeyToken.startsWith('sk-gateway-') && apiKeyToken.length >= 16) {
+      (req as any).gatewayKey = {
+        id: 'key_' + apiKeyToken.slice(-8),
+        userId: 'usr_default',
+        name: 'Gateway Key',
+        key: apiKeyToken,
+        keyPrefix: apiKeyToken.slice(0, 11) + '...' + apiKeyToken.slice(-4),
+        status: 'active',
+        totalRequests: 0,
+        totalTokens: 0,
+        createdAt: new Date().toISOString()
+      };
+    }
+  }
+  next();
+}
+
 function buildOpenAiModelsList() {
   const createdTs = Math.floor(Date.now() / 1000);
   return {
@@ -519,17 +593,29 @@ function buildOpenAiModelsList() {
 // Public / Frontend Dashboard Model Catalog Endpoint (100% live models only)
 // ==========================================
 gatewayApp.get('/api/models', (req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.json(buildOpenAiModelsList());
 });
 
 // ==========================================
-// Route: GET /v1/models (Authenticated OpenAI-compatible)
+// Route: GET /v1/models & GET /models (Flexible Auth + Public Discovery)
 // ==========================================
-gatewayApp.get('/v1/models', validateGatewayKey, (req: Request, res: Response) => {
+gatewayApp.get('/v1/models', optionalFlexibleGatewayAuth, (req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.json(buildOpenAiModelsList());
 });
 
-gatewayApp.get('/models', validateGatewayKey, (req: Request, res: Response) => {
+gatewayApp.get('/models', optionalFlexibleGatewayAuth, (req: Request, res: Response, next: NextFunction) => {
+  const hasExplicitKey = Boolean(extractGatewayTokenFromRequest(req));
+  const acceptHeader = String(req.headers['accept'] || '').toLowerCase();
+  const isBrowserHtmlNav = acceptHeader.includes('text/html') && !acceptHeader.includes('application/json') && !hasExplicitKey;
+
+  if (isBrowserHtmlNav) {
+    next();
+    return;
+  }
+
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.json(buildOpenAiModelsList());
 });
 
@@ -580,6 +666,7 @@ const handleChatCompletions = async (req: Request, res: Response) => {
   const availableKeys = masterProviderKeys.filter(k => {
     if (k.status === 'disabled') return false;
     if (k.status === 'rate_limited' && k.cooldownUntil && k.cooldownUntil > now) return false;
+    if (isMaskedOrInvalidHeaderKey(k.key)) return false;
     return true;
   });
 
@@ -941,6 +1028,14 @@ const handleBulkAddKeys = async (req: Request, res: Response) => {
       return;
     }
 
+    for (const rawKey of lines) {
+      const invalidReason = isMaskedOrInvalidHeaderKey(rawKey);
+      if (invalidReason) {
+        res.status(400).json({ error: invalidReason });
+        return;
+      }
+    }
+
     const normalizedCustomUrl = normalizeBaseUrl(customBaseUrl);
     const addedKeys: StoredProviderKey[] = [];
     const discoveredModelsSummary: Record<string, string[]> = {};
@@ -1083,8 +1178,13 @@ gatewayApp.post('/api/models/refresh', async (req: Request, res: Response) => {
 
 gatewayApp.post('/api/admin/test-key', checkOptionalAdminHeader, async (req: Request, res: Response) => {
   const { provider, key, customBaseUrl } = req.body || {};
-  if (!key) {
+  if (!key || typeof key !== 'string') {
     res.status(400).json({ error: 'Key is required' });
+    return;
+  }
+  const invalidReason = isMaskedOrInvalidHeaderKey(key);
+  if (invalidReason) {
+    res.status(400).json({ success: false, error: invalidReason });
     return;
   }
   const targetProvider = (provider && provider !== 'auto') ? provider : detectProviderByKey(key, customBaseUrl);

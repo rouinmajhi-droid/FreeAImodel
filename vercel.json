@@ -5,6 +5,16 @@
       "includeFiles": "server/**"
     }
   },
+  "headers": [
+    {
+      "source": "/v1/(.*)",
+      "headers": [
+        { "key": "Access-Control-Allow-Origin", "value": "*" },
+        { "key": "Access-Control-Allow-Methods", "value": "GET, POST, OPTIONS" },
+        { "key": "Access-Control-Allow-Headers", "value": "Content-Type, Authorization, x-api-key" }
+      ]
+    }
+  ],
   "rewrites": [
     {
       "source": "/v1/(.*)",
@@ -12,6 +22,47 @@
     },
     {
       "source": "/api/(.*)",
+      "destination": "/api/index"
+    },
+    {
+      "source": "/models",
+      "missing": [
+        {
+          "type": "header",
+          "key": "accept",
+          "value": ".*text/html.*"
+        }
+      ],
+      "destination": "/api/index"
+    },
+    {
+      "source": "/models",
+      "has": [
+        {
+          "type": "header",
+          "key": "authorization"
+        }
+      ],
+      "destination": "/api/index"
+    },
+    {
+      "source": "/models",
+      "has": [
+        {
+          "type": "header",
+          "key": "x-api-key"
+        }
+      ],
+      "destination": "/api/index"
+    },
+    {
+      "source": "/models",
+      "has": [
+        {
+          "type": "query",
+          "key": "key"
+        }
+      ],
       "destination": "/api/index"
     },
     {

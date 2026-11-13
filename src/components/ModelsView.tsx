@@ -60,6 +60,28 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
     e.preventDefault();
     if (!inputKeys.trim()) return;
 
+    const lines = inputKeys
+      .split(/[\r\n,]+/)
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0 && !l.startsWith('#'));
+
+    for (const line of lines) {
+      if (line.includes('…') || line.includes('...') || line.includes('•')) {
+        setAddResult({
+          message: 'Masked key detected, please paste the full raw API key',
+          isError: true
+        });
+        return;
+      }
+      if (/[^\x21-\x7E]/.test(line)) {
+        setAddResult({
+          message: 'Invalid non-ASCII characters detected. Please paste the full raw API key.',
+          isError: true
+        });
+        return;
+      }
+    }
+
     setIsSubmitting(true);
     setAddResult(null);
 

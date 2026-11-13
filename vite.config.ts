@@ -9,8 +9,15 @@ function nexusGatePlugin(): Plugin {
     name: 'nexusgate-api-gateway',
     configureServer(server) {
       server.middlewares.use((req, res, next) => {
-        if (req.url && (req.url.startsWith('/v1') || req.url.startsWith('/api'))) {
-          return gatewayApp(req as any, res as any, next);
+        if (req.url) {
+          const isApiAliasModels = (req.url === '/models' || req.url.startsWith('/models?')) &&
+            (!(String(req.headers.accept || '').toLowerCase().includes('text/html')) ||
+              Boolean(req.headers.authorization) ||
+              Boolean(req.headers['x-api-key']) ||
+              req.url.includes('key='));
+          if (req.url.startsWith('/v1') || req.url.startsWith('/api') || isApiAliasModels) {
+            return gatewayApp(req as any, res as any, next);
+          }
         }
         next();
       });
@@ -27,6 +34,7 @@ export default defineConfig(() => {
       },
     },
     server: {
+      cors: false,
       // HMR is disabled in AI Studio via DISABLE_HMR env var.
       hmr: process.env.DISABLE_HMR !== 'true',
       watch: process.env.DISABLE_HMR === 'true' ? null : {},
