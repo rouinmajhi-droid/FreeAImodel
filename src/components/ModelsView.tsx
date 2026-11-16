@@ -9,7 +9,6 @@ import {
   Copy, 
   X, 
   AlertCircle,
-  Key,
   Layers
 } from 'lucide-react';
 import { GatewayModel, ProviderKey } from '../types/gateway';
@@ -28,16 +27,13 @@ interface ModelsViewProps {
 
 export const ModelsView: React.FC<ModelsViewProps> = ({
   models,
-  providerKeys = [],
   isAdmin = false,
   onSelectModelForPlayground,
   onAddKeyAndFetchModels,
   onRefreshModels,
-  onDeleteKey,
 }) => {
   const [search, setSearch] = useState('');
   const [providerFilter, setProviderFilter] = useState('all');
-  const [selectedKeyFilter, setSelectedKeyFilter] = useState<string | null>(null);
 
   // Add Key Modal State
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
@@ -110,17 +106,9 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
     }
   };
 
-  // Filter models based on search, provider dropdown, and clicked key source filter
+  // Filter models based on search query and provider dropdown
   const filtered = models.filter((m) => {
     if (providerFilter !== 'all' && m.provider !== providerFilter) return false;
-    
-    // If filtered by a specific key source
-    if (selectedKeyFilter) {
-      const activeKeyObj = providerKeys.find(pk => pk.id === selectedKeyFilter || pk.keyHint === selectedKeyFilter);
-      if (activeKeyObj && activeKeyObj.supportedModels && activeKeyObj.supportedModels.length > 0) {
-        if (!activeKeyObj.supportedModels.includes(m.id)) return false;
-      }
-    }
 
     if (search) {
       const query = search.toLowerCase();
@@ -172,67 +160,7 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
         </div>
       </div>
 
-      {/* 2. Connected Key Sources (Admin Only) */}
-      {isAdmin && providerKeys.length > 0 && (
-        <div className="bg-white border border-zinc-200/80 rounded-xl px-4 py-3 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-          <div className="flex items-center gap-2 flex-wrap">
-            <span className="text-xs font-semibold text-zinc-500 uppercase tracking-wider flex items-center gap-1.5">
-              <Key className="w-3.5 h-3.5 text-violet-600" />
-              <span>Connected Sources:</span>
-            </span>
-
-            {providerKeys.map((pk) => {
-              const isSelected = selectedKeyFilter === pk.id;
-              const modelCount = pk.supportedModels?.length || 0;
-
-              return (
-                <div
-                  key={pk.id}
-                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs transition-all ${
-                    isSelected
-                      ? 'bg-violet-50 border-violet-400 text-violet-900 shadow-xs'
-                      : 'bg-zinc-50 border-zinc-200/80 text-zinc-700 hover:border-zinc-300'
-                  }`}
-                >
-                  <button
-                    onClick={() => setSelectedKeyFilter(isSelected ? null : pk.id)}
-                    className="flex items-center gap-1.5 cursor-pointer text-left"
-                    title={`Filter by ${pk.keyHint}`}
-                  >
-                    <ProviderLogo provider={pk.provider} size={13} />
-                    <span className="font-mono text-[11px] font-medium">{pk.keyHint}</span>
-                    <span className="text-[10px] font-semibold px-1.5 py-0.2 rounded-full bg-violet-100 text-violet-700">
-                      {modelCount}
-                    </span>
-                  </button>
-
-                  {onDeleteKey && (
-                    <button
-                      onClick={() => onDeleteKey(pk.id)}
-                      className="text-zinc-400 hover:text-rose-600 ml-0.5 p-0.5 rounded transition-colors cursor-pointer"
-                      title="Remove key"
-                    >
-                      <X className="w-3 h-3" />
-                    </button>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-
-          {selectedKeyFilter && (
-            <button
-              onClick={() => setSelectedKeyFilter(null)}
-              className="text-xs font-medium text-violet-600 hover:text-violet-800 flex items-center gap-1 shrink-0 cursor-pointer self-start sm:self-auto"
-            >
-              <X className="w-3.5 h-3.5" />
-              <span>Clear Filter</span>
-            </button>
-          )}
-        </div>
-      )}
-
-      {/* 3. Search & Filter Bar */}
+      {/* 2. Search & Filter Bar */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white p-3.5 rounded-xl border border-zinc-200/80 shadow-xs">
         <div className="relative flex-1 max-w-md">
           <Search className="w-4 h-4 text-zinc-400 absolute left-3 top-1/2 -translate-y-1/2" />
@@ -289,7 +217,6 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
               onClick={() => {
                 setSearch('');
                 setProviderFilter('all');
-                setSelectedKeyFilter(null);
               }}
               className="px-4 py-2 text-xs font-semibold text-zinc-700 bg-zinc-100 hover:bg-zinc-200 rounded-lg transition-colors cursor-pointer"
             >
