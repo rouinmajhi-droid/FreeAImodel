@@ -4,21 +4,24 @@ import {
   doc,
   getDocFromServer
 } from 'firebase/firestore';
-import { getDatabase } from 'firebase/database';
 import { getAuth, GoogleAuthProvider, GithubAuthProvider, OAuthProvider } from 'firebase/auth';
-import firebaseConfig from '../../firebase-applet-config.json';
+import firebaseAppletConfig from '../../firebase-applet-config.json';
 
-const resolvedFirebaseConfig = {
-  ...firebaseConfig,
+export const firebaseConfig = {
+  apiKey: 'AIzaSyBORpX4X_HTiNn_gEruKo6NBX5saZni4d8',
+  authDomain: 'aisdd-6f89e.firebaseapp.com',
   databaseURL: 'https://aisdd-6f89e-default-rtdb.firebaseio.com',
-  measurementId: firebaseConfig.measurementId || 'G-FHF7PB7BTM'
+  projectId: 'aisdd-6f89e',
+  storageBucket: 'aisdd-6f89e.firebasestorage.app',
+  messagingSenderId: '624778913380',
+  appId: '1:624778913380:web:e3719cb5afa199ce332171',
+  measurementId: 'G-FHF7PB7BTM'
 };
 
-export const app = getApps().length === 0 ? initializeApp(resolvedFirebaseConfig) : getApps()[0];
+export const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
 
 // CRITICAL: Keep passing firestoreDatabaseId from firebase-applet-config.json
-export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
-export const rtdb = getDatabase(app);
+export const db = getFirestore(app, firebaseAppletConfig.firestoreDatabaseId);
 export const auth = getAuth(app);
 
 export const googleProvider = new GoogleAuthProvider();

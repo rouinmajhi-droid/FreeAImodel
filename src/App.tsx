@@ -322,7 +322,7 @@ function GatewayApp() {
     return () => unsubscribe();
   }, []);
 
-  // Initialize data & synchronize with Firestore + Gateway Backend
+  // Initialize data directly from Firebase Firestore (aisdd-6f89e) & sync gateway router
   useEffect(() => {
     let cancelled = false;
 
@@ -332,30 +332,84 @@ function GatewayApp() {
       let loadedModels: GatewayModel[] = [];
       let loadedApiKeys: ApiKey[] = [];
       let loadedProviderKeys: ProviderKey[] = [];
+      let adminFirestoreLoaded = false;
 
-      // 1. Fetch public/cached models from gateway backend
-      try {
-        const res = await fetch('/api/models');
-        if (res.ok) {
-          const data = await parseJsonSafe(res);
-          if (Array.isArray(data.data)) {
-            loadedModels = data.data.map((m: any) => ({
-              id: m.id,
-              name: m.name || m.id.replace(/[-_]/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
-              provider: m.provider || m.owned_by || 'custom',
-              ownerKeyId: m.ownerKeyId,
-              ownerKeyHint: m.ownerKeyHint,
-              discoveredAt: m.discoveredAt || new Date().toISOString()
-            }));
+      if (currentUser) {
+        // 1. Always read User's Gateway API Keys directly from Firebase Firestore
+        try {
+          const keysQ = query(collection(db, 'api_keys'), where('userId', '==', currentUser.uid));
+          const keysSnap = await getDocs(keysQ);
+          loadedApiKeys = keysSnap.docs.map(d => d.data() as ApiKey);
+        } catch (err) {
+          try {
+            handleFirestoreError(err, OperationType.LIST, 'api_keys');
+          } catch {
+            // Structured error logged
           }
         }
-      } catch (e) {
-        console.warn('Failed to load models from backend:', e);
+
+        // 2. Always read Live Models directly from Firebase Firestore (authoritative source)
+        try {
+          const modelsSnap = await getDocs(collection(db, 'models'));
+          loadedModels = modelsSnap.docs
+            .map(d => d.data() as GatewayModel)
+            .filter(m => Boolean(m?.id && m?.ownerKeyId))
+            .sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
+        } catch (err) {
+          try {
+            handleFirestoreError(err, OperationType.GET, 'models');
+          } catch {
+            // Structured error logged
+          }
+        }
+
+        // 3. If Admin, always read Master Provider Key Pool directly from Firebase Firestore
+        if (isAdmin) {
+          try {
+            const pkSnap = await getDocs(collection(db, 'provider_keys'));
+            const byKey = new Map<string, ProviderKey>();
+            for (const d of pkSnap.docs) {
+              const pk = d.data() as ProviderKey;
+              if (pk?.key) byKey.set(pk.key, pk);
+            }
+            loadedProviderKeys = Array.from(byKey.values());
+            adminFirestoreLoaded = true;
+          } catch (err) {
+            try {
+              handleFirestoreError(err, OperationType.GET, 'provider_keys');
+            } catch {
+              // Structured error logged
+            }
+          }
+        }
+      } else {
+        // Public landing page: fetch active models from gateway endpoint
+        try {
+          const res = await fetch('/api/models');
+          if (res.ok) {
+            const data = await parseJsonSafe(res);
+            if (Array.isArray(data.data)) {
+              loadedModels = data.data.map((m: any) => ({
+                id: m.id,
+                name: m.name || m.id.replace(/[-_]/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
+                provider: m.provider || m.owned_by || 'custom',
+                ownerKeyId: m.ownerKeyId,
+                ownerKeyHint: m.ownerKeyHint,
+                discoveredAt: m.discoveredAt || new Date().toISOString()
+              }));
+            }
+          }
+        } catch (e) {
+          console.warn('Failed to load public models:', e);
+        }
       }
 
-      // 2. Fetch live stats & logs
+      // Fetch live stats & logs
       try {
-        const statsRes = await fetch('/api/stats');
+        const fbToken = await getFirebaseIdToken();
+        const statsRes = await fetch('/api/stats', {
+          headers: fbToken ? { 'x-firebase-token': fbToken } : {}
+        });
         if (statsRes.ok) {
           const statsData = await parseJsonSafe(statsRes);
           if (!cancelled && Array.isArray(statsData.logs)) {
@@ -366,120 +420,20 @@ function GatewayApp() {
         // Ignore
       }
 
-      // 3. When authenticated with Firebase, load user's persisted API keys, real models & (if admin) provider pool
-      if (currentUser) {
-        try {
-          const keysQ = query(collection(db, 'api_keys'), where('userId', '==', currentUser.uid));
-          const keysSnap = await getDocs(keysQ);
-          loadedApiKeys = keysSnap.docs.map(d => d.data() as ApiKey);
-        } catch (err) {
-          try {
-            handleFirestoreError(err, OperationType.LIST, 'api_keys');
-          } catch {
-            // Non-blocking fallback
-          }
-        }
-
-        // Only hydrate live-discovered models (with ownerKeyId) from Firestore if backend memory is empty
-        if (loadedModels.length === 0) {
-          try {
-            const modelsSnap = await getDocs(collection(db, 'models'));
-            if (!modelsSnap.empty) {
-              const firestoreModels = modelsSnap.docs
-                .map(d => d.data() as GatewayModel)
-                .filter(m => Boolean(m.ownerKeyId));
-              if (firestoreModels.length > 0) {
-                loadedModels = firestoreModels;
-              }
-            }
-          } catch (err) {
-            console.warn('Could not read models from Firestore:', err);
-          }
-        }
-
-        if (isAdmin) {
-          try {
-            const pkSnap = await getDocs(collection(db, 'provider_keys'));
-            const firestorePool = pkSnap.docs.map(d => d.data() as ProviderKey);
-
-            // Also check any keys already in backend cache
-            const fbToken = await getFirebaseIdToken();
-            const adminKeysRes = await fetch('/api/admin/keys', {
-              headers: {
-                'x-user-email': currentUser.email || '',
-                ...(fbToken ? { 'x-firebase-token': fbToken } : {})
-              }
-            }).catch(() => null);
-            const backendPool: ProviderKey[] = adminKeysRes && adminKeysRes.ok
-              ? ((await parseJsonSafe(adminKeysRes)).keys || [])
-              : [];
-
-            // Merge & deduplicate by raw API key so Firestore is never overwritten or duplicated
-            const mergedByKey = new Map<string, ProviderKey>();
-            for (const pk of backendPool) {
-              if (pk?.key) mergedByKey.set(pk.key, pk);
-            }
-            const firestoreKeysSet = new Set<string>();
-            for (const pk of firestorePool) {
-              if (pk?.key) {
-                firestoreKeysSet.add(pk.key);
-                mergedByKey.set(pk.key, pk);
-              }
-            }
-            loadedProviderKeys = Array.from(mergedByKey.values());
-
-            // Backfill any backend-only keys into Firestore permanently
-            const missingInFirestore = loadedProviderKeys.filter(pk => pk.key && !firestoreKeysSet.has(pk.key));
-            if (missingInFirestore.length > 0) {
-              for (let i = 0; i < missingInFirestore.length; i += 400) {
-                const batch = writeBatch(db);
-                for (const pk of missingInFirestore.slice(i, i + 400)) {
-                  const safeDoc = buildSafeProviderKeyDoc(pk);
-                  batch.set(doc(db, 'provider_keys', safeDoc.id), safeDoc);
-                }
-                await batch.commit().catch(() => {});
-              }
-            }
-          } catch (err) {
-            console.warn('Could not load provider_keys from Firestore:', err);
-          }
-        }
-      }
-
       if (cancelled) return;
 
       setModels(loadedModels);
       setApiKeys(loadedApiKeys);
       setProviderKeys(loadedProviderKeys);
 
-      // Merge into backend memory cleanly (never wipe with replaceProviderKeys=true on boot)
-      await syncWithBackend(
-        loadedApiKeys,
-        isAdmin ? loadedProviderKeys : [],
-        loadedModels,
-        false
-      );
-
-      // Re-read backend models in case backend rebuilt from synced provider keys
-      if (loadedProviderKeys.length > 0) {
-        try {
-          const refreshedRes = await fetch('/api/models');
-          if (refreshedRes.ok) {
-            const refreshedData = await parseJsonSafe(refreshedRes);
-            if (!cancelled && Array.isArray(refreshedData.data)) {
-              setModels(refreshedData.data.map((m: any) => ({
-                id: m.id,
-                name: m.name || m.id.replace(/[-_]/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
-                provider: m.provider || m.owned_by || 'custom',
-                ownerKeyId: m.ownerKeyId,
-                ownerKeyHint: m.ownerKeyHint,
-                discoveredAt: m.discoveredAt || new Date().toISOString()
-              })));
-            }
-          }
-        } catch {
-          // Ignore
-        }
+      // Hydrate backend router memory cleanly from Firestore's authoritative records
+      if (currentUser) {
+        await syncWithBackend(
+          loadedApiKeys,
+          isAdmin ? loadedProviderKeys : [],
+          loadedModels,
+          isAdmin && adminFirestoreLoaded
+        );
       }
     };
 
@@ -487,9 +441,9 @@ function GatewayApp() {
     return () => {
       cancelled = true;
     };
-  }, [currentUser, isAdmin, syncWithBackend]);
+  }, [currentUser, isAdmin, syncWithBackend, getFirebaseIdToken]);
 
-  // Real-time Firestore listener so User Panel automatically receives synced models
+  // Real-time Firestore listener so User Panel automatically reflects all synced models
   useEffect(() => {
     if (!currentUser) return;
     const unsubscribe = onSnapshot(
@@ -497,48 +451,67 @@ function GatewayApp() {
       (snapshot) => {
         const liveModels = snapshot.docs
           .map((d) => d.data() as GatewayModel)
-          .filter((m) => Boolean(m?.id && m?.ownerKeyId));
-        if (liveModels.length > 0) {
-          setModels(liveModels);
-        }
+          .filter((m) => Boolean(m?.id && m?.ownerKeyId))
+          .sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
+        setModels(liveModels);
       },
       (error) => {
         try {
           handleFirestoreError(error, OperationType.GET, 'models');
         } catch {
-          // Non-blocking fallback if rules reject
+          // Structured error logged
         }
       }
     );
     return () => unsubscribe();
   }, [currentUser]);
 
-  // Real-time Firestore listener for Admin Provider Pool so keys never disappear across reloads/tabs
+  // Real-time Firestore listener for User's Gateway API Keys
+  useEffect(() => {
+    if (!currentUser) return;
+    const keysQ = query(collection(db, 'api_keys'), where('userId', '==', currentUser.uid));
+    const unsubscribe = onSnapshot(
+      keysQ,
+      (snapshot) => {
+        const liveApiKeys = snapshot.docs
+          .map((d) => d.data() as ApiKey)
+          .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+        setApiKeys(liveApiKeys);
+        syncWithBackend(liveApiKeys, [], undefined, false).catch(() => {});
+      },
+      (error) => {
+        try {
+          handleFirestoreError(error, OperationType.LIST, 'api_keys');
+        } catch {
+          // Structured error logged
+        }
+      }
+    );
+    return () => unsubscribe();
+  }, [currentUser, syncWithBackend]);
+
+  // Real-time Firestore listener for Admin Provider Pool (authoritative real-time sync)
   useEffect(() => {
     if (!currentUser || !isAdmin) return;
     const unsubscribe = onSnapshot(
       collection(db, 'provider_keys'),
       (snapshot) => {
-        const docs = snapshot.docs.map((d) => d.data() as ProviderKey).filter((pk) => Boolean(pk?.key));
-        if (docs.length > 0) {
-          setProviderKeys((prev) => {
-            const byKey = new Map<string, ProviderKey>();
-            for (const p of prev) {
-              if (p?.key) byKey.set(p.key, p);
-            }
-            for (const d of docs) {
-              byKey.set(d.key, d);
-            }
-            return Array.from(byKey.values());
-          });
-          syncWithBackend([], docs, undefined, false).catch(() => {});
+        const byKey = new Map<string, ProviderKey>();
+        for (const d of snapshot.docs) {
+          const pk = d.data() as ProviderKey;
+          if (pk?.key) byKey.set(pk.key, pk);
         }
+        const docs = Array.from(byKey.values()).sort((a, b) =>
+          (b.createdAt || '').localeCompare(a.createdAt || '')
+        );
+        setProviderKeys(docs);
+        syncWithBackend([], docs, undefined, true).catch(() => {});
       },
       (error) => {
         try {
           handleFirestoreError(error, OperationType.GET, 'provider_keys');
         } catch {
-          // Non-blocking fallback
+          // Structured error logged
         }
       }
     );

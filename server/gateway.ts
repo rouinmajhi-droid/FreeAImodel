@@ -1,9 +1,6 @@
 import express, { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 import dotenv from 'dotenv';
-import fs from 'fs';
-import os from 'os';
-import path from 'path';
 import {
   listCollectionFromFirestore,
   upsertDocumentInFirestore,
@@ -146,81 +143,13 @@ export function ensureDailyCreditsReset(account: StoredUserAccount): boolean {
 }
 
 // ==========================================
-// In-memory Master Stores + File Persistence Cache (Zero Fake/Demo Seed Models)
+// In-memory Master Stores (Authoritative persistence via Firebase Firestore)
 // ==========================================
 export const masterApiKeys = new Map<string, StoredApiKey>();
 export const masterProviderKeys: StoredProviderKey[] = [];
 export const masterModels = new Map<string, StoredModel>();
 export const masterLogs: StoredRequestLog[] = [];
 export const masterUsers = new Map<string, StoredUserAccount>();
-
-function getCacheFilePath(): string {
-  return path.join(os.tmpdir(), '.gateway-cache.json');
-}
-
-export function saveGatewayCache(): void {
-  try {
-    const filePath = getCacheFilePath();
-    const payload = {
-      apiKeys: Array.from(masterApiKeys.values()),
-      providerKeys: masterProviderKeys,
-      models: Array.from(masterModels.values()),
-      logs: masterLogs.slice(0, 200),
-      users: Array.from(masterUsers.values()),
-      updatedAt: new Date().toISOString()
-    };
-    fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf-8');
-  } catch {
-    // Non-fatal in read-only environments
-  }
-}
-
-function loadGatewayCache(): void {
-  try {
-    const candidates = [
-      path.join(os.tmpdir(), '.gateway-cache.json'),
-      '/tmp/.gateway-cache.json'
-    ];
-    for (const filePath of candidates) {
-      if (fs.existsSync(filePath)) {
-        const raw = fs.readFileSync(filePath, 'utf-8');
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed.apiKeys)) {
-          for (const k of parsed.apiKeys) {
-            if (k?.key) masterApiKeys.set(k.key, k);
-          }
-        }
-        if (Array.isArray(parsed.providerKeys)) {
-          masterProviderKeys.length = 0;
-          for (const pk of parsed.providerKeys) {
-            if (pk?.id && pk?.key) masterProviderKeys.push(pk);
-          }
-        }
-        if (Array.isArray(parsed.models)) {
-          masterModels.clear();
-          for (const m of parsed.models) {
-            if (m?.id && m?.ownerKeyId) masterModels.set(m.id, m);
-          }
-        }
-        if (Array.isArray(parsed.logs)) {
-          masterLogs.length = 0;
-          masterLogs.push(...parsed.logs);
-        }
-        if (Array.isArray(parsed.users)) {
-          masterUsers.clear();
-          for (const u of parsed.users) {
-            if (u?.uid) masterUsers.set(u.uid, u);
-          }
-        }
-        return;
-      }
-    }
-  } catch {
-    // Ignore cache parse errors
-  }
-}
-
-loadGatewayCache();
 
 let lastHydratedAt = 0;
 let hydrationInFlight: Promise<void> | null = null;
@@ -290,8 +219,7 @@ export async function ensureGatewayHydrated(explicitIdToken?: string, force = fa
       }
 
       lastHydratedAt = Date.now();
-      saveGatewayCache();
-    } catch (err) {
+        } catch (err) {
       console.warn('[FreeAIModel] Firestore hydration skipped:', err);
     } finally {
       hydrationInFlight = null;
@@ -511,7 +439,6 @@ export function rebuildMasterModelsFromPool(): void {
   for (const [id, model] of nextModels.entries()) {
     masterModels.set(id, model);
   }
-  saveGatewayCache();
 }
 
 export function isMaskedOrInvalidHeaderKey(rawKey: string): string | null {
@@ -733,8 +660,7 @@ async function resolveRegisteredGatewayKey(apiKeyToken: string): Promise<StoredA
   const dbMatch = await findApiKeyBySecretInFirestore<StoredApiKey>(apiKeyToken);
   if (dbMatch && dbMatch.key) {
     masterApiKeys.set(dbMatch.key, dbMatch);
-    saveGatewayCache();
-    return dbMatch;
+      return dbMatch;
   }
 
   return null;
@@ -1334,8 +1260,7 @@ const handleChatCompletions = async (req: Request, res: Response) => {
 
   // Persist rotated/rate-limited/exhausted provider key telemetry to Firestore + /tmp cache
   if (dirtyProviderKeys.size > 0) {
-    saveGatewayCache();
-    Promise.all(
+      Promise.all(
       Array.from(dirtyProviderKeys).map(pk => upsertDocumentInFirestore('provider_keys', pk.id, pk))
     ).catch(() => {});
   }
@@ -1394,7 +1319,6 @@ const handleChatCompletions = async (req: Request, res: Response) => {
     userAccount.updatedAt = new Date().toISOString();
   }
 
-  saveGatewayCache();
 
   // Background Firestore persistence for usage, key stats, and telemetry log
   Promise.all([
@@ -1440,7 +1364,6 @@ gatewayApp.post('/api/auth/session', (req: Request, res: Response) => {
     ensureDailyCreditsReset(account);
   }
 
-  saveGatewayCache();
 
   res.json({
     uid: account.uid,
@@ -1464,8 +1387,7 @@ gatewayApp.get('/api/user/credits', (req: Request, res: Response) => {
     : Array.from(masterUsers.values()).find(u => u.email.toLowerCase() === email.toLowerCase());
 
   if (account) {
-    const resetOccurred = ensureDailyCreditsReset(account);
-    if (resetOccurred) saveGatewayCache();
+    ensureDailyCreditsReset(account);
     res.json({
       uid: account.uid,
       role: account.role,
@@ -1528,8 +1450,7 @@ gatewayApp.post('/api/keys', async (req: Request, res: Response) => {
     };
 
     masterApiKeys.set(newKey.key, newKey);
-    saveGatewayCache();
-
+  
     const persistedToDb = await upsertDocumentInFirestore('api_keys', newKey.id, newKey, fbToken);
 
     res.status(200).json({
@@ -1553,7 +1474,6 @@ gatewayApp.delete('/api/keys/:id', async (req: Request, res: Response) => {
       removed = true;
     }
   }
-  saveGatewayCache();
 
   await deleteDocumentFromFirestore('api_keys', id, fbToken);
 
@@ -1675,8 +1595,7 @@ const handleBulkAddKeys = async (req: Request, res: Response) => {
 
     rebuildMasterModelsFromPool();
     lastHydratedAt = Date.now();
-    saveGatewayCache();
-
+  
     // Persist added provider keys and discovered models directly to Firestore
     const syncedModelsList = Array.from(masterModels.values());
     let firestorePersistedCount = 0;
@@ -1744,7 +1663,6 @@ gatewayApp.post('/api/admin/keys/reset-cooldowns', checkOptionalAdminHeader, asy
   }
 
   rebuildMasterModelsFromPool();
-  saveGatewayCache();
 
   await Promise.all(
     restored.map(pk => upsertDocumentInFirestore('provider_keys', pk.id, pk, fbToken))
@@ -1773,7 +1691,6 @@ gatewayApp.patch('/api/admin/keys/:id/status', checkOptionalAdminHeader, async (
   target.cooldownUntil = undefined;
   target.updatedAt = new Date().toISOString();
   rebuildMasterModelsFromPool();
-  saveGatewayCache();
 
   const modelsList = Array.from(masterModels.values());
   await Promise.all([
@@ -1794,7 +1711,6 @@ gatewayApp.delete('/api/admin/keys/:id', checkOptionalAdminHeader, async (req: R
     masterProviderKeys.splice(idx, 1);
   }
   rebuildMasterModelsFromPool();
-  saveGatewayCache();
 
   const modelsList = Array.from(masterModels.values());
   await Promise.all([
@@ -1829,7 +1745,6 @@ gatewayApp.post('/api/models/refresh', async (req: Request, res: Response) => {
   }
 
   rebuildMasterModelsFromPool();
-  saveGatewayCache();
 
   const modelsList = Array.from(masterModels.values());
   await Promise.all([
@@ -1937,7 +1852,6 @@ gatewayApp.post('/api/gateway/sync', (req: Request, res: Response) => {
     }
   }
 
-  saveGatewayCache();
 
   res.json({
     success: true,
