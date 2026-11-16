@@ -126,6 +126,18 @@ function GatewayApp() {
     return sanitized || 'id_' + Math.random().toString(36).substring(2, 10);
   };
 
+  // Helper to obtain the authenticated user's Firebase ID token for backend Firestore REST operations
+  const getFirebaseIdToken = useCallback(async (): Promise<string | undefined> => {
+    try {
+      if (auth.currentUser) {
+        return await auth.currentUser.getIdToken();
+      }
+    } catch {
+      // ignore
+    }
+    return undefined;
+  }, []);
+
   // Sync state with backend memory router (keys + models from Admin Panel)
   const syncWithBackend = useCallback(async (
     currentApiKeys: ApiKey[],
@@ -134,11 +146,15 @@ function GatewayApp() {
     replaceProviderKeys = false
   ) => {
     try {
+      const fbToken = await getFirebaseIdToken();
       await fetch('/api/gateway/sync', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          apiKeys: currentApiKeys, 
+        headers: {
+          'Content-Type': 'application/json',
+          ...(fbToken ? { 'x-firebase-token': fbToken } : {})
+        },
+        body: JSON.stringify({
+          apiKeys: currentApiKeys,
           providerKeys: currentProviderKeys,
           models: currentModels,
           replaceProviderKeys
@@ -147,7 +163,7 @@ function GatewayApp() {
     } catch {
       // background sync
     }
-  }, []);
+  }, [getFirebaseIdToken]);
 
   // Firebase Auth State Listener — checks Rouinmajhi@gmail.com for Admin role & runs daily 50B credits reset
   useEffect(() => {
@@ -336,8 +352,12 @@ function GatewayApp() {
             const firestorePool = pkSnap.docs.map(d => d.data() as ProviderKey);
 
             // Also check any keys already in backend cache
+            const fbToken = await getFirebaseIdToken();
             const adminKeysRes = await fetch('/api/admin/keys', {
-              headers: { 'x-user-email': currentUser.email || '' }
+              headers: {
+                'x-user-email': currentUser.email || '',
+                ...(fbToken ? { 'x-firebase-token': fbToken } : {})
+              }
             }).catch(() => null);
             const backendPool: ProviderKey[] = adminKeysRes && adminKeysRes.ok
               ? ((await parseJsonSafe(adminKeysRes)).keys || [])
@@ -430,14 +450,14 @@ function GatewayApp() {
     showToast('Signed Out', 'You have been disconnected from the session.', 'info');
   };
 
-  // Create Gateway API Key
+  // Create Gateway API Key (persists to Backend /api/keys + Firestore api_keys)
   const handleCreateApiKey = async (name: string): Promise<ApiKey> => {
     const randomHex = Array.from(crypto.getRandomValues(new Uint8Array(16)))
       .map(b => b.toString(16).padStart(2, '0'))
       .join('');
     const fullKey = `sk-gateway-${randomHex}`;
 
-    const newKey: ApiKey = {
+    let newKey: ApiKey = {
       id: 'key_' + Math.random().toString(36).substring(2, 10),
       userId: activeUid,
       name,
@@ -449,14 +469,43 @@ function GatewayApp() {
       createdAt: new Date().toISOString()
     };
 
+    const fbToken = await getFirebaseIdToken();
+    try {
+      const res = await fetch('/api/keys', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(fbToken ? { 'x-firebase-token': fbToken } : {})
+        },
+        body: JSON.stringify({
+          id: newKey.id,
+          userId: newKey.userId,
+          name: newKey.name,
+          key: newKey.key
+        })
+      });
+      if (res.ok) {
+        const data = await parseJsonSafe(res);
+        if (data?.key?.key) {
+          newKey = data.key as ApiKey;
+        }
+      }
+    } catch {
+      // Fallback to client-generated key + sync
+    }
+
     const updated = [newKey, ...apiKeys];
     setApiKeys(updated);
 
     if (currentUser) {
       try {
-        await setDoc(doc(db, 'api_keys', newKey.id), newKey);
+        await setDoc(doc(db, 'api_keys', newKey.id), sanitizeForFirestore(newKey));
       } catch (err) {
-        console.warn('Could not persist key to Firestore:', err);
+        try {
+          handleFirestoreError(err, OperationType.CREATE, `api_keys/${newKey.id}`);
+        } catch {
+          // Non-blocking fallback
+        }
       }
     }
 
@@ -464,16 +513,30 @@ function GatewayApp() {
     return newKey;
   };
 
-  // Delete Gateway API Key
+  // Delete Gateway API Key (removes from Backend /api/keys + Firestore api_keys)
   const handleDeleteApiKey = async (keyId: string) => {
     const updated = apiKeys.filter(k => k.id !== keyId);
     setApiKeys(updated);
+
+    const fbToken = await getFirebaseIdToken();
+    try {
+      await fetch(`/api/keys/${encodeURIComponent(keyId)}`, {
+        method: 'DELETE',
+        headers: fbToken ? { 'x-firebase-token': fbToken } : {}
+      });
+    } catch {
+      // Ignore network fallback
+    }
 
     if (currentUser) {
       try {
         await deleteDoc(doc(db, 'api_keys', keyId));
       } catch (err) {
-        console.warn('Could not delete from Firestore:', err);
+        try {
+          handleFirestoreError(err, OperationType.DELETE, `api_keys/${keyId}`);
+        } catch {
+          // Non-blocking fallback
+        }
       }
     }
 
@@ -494,20 +557,31 @@ function GatewayApp() {
       }
       for (const m of modelsList) {
         const docId = toFirestoreDocId(m.id);
-        await setDoc(doc(db, 'models', docId), sanitizeForFirestore(m));
+        await setDoc(doc(db, 'models', docId), sanitizeForFirestore({
+          ...m,
+          id: String(m.id).slice(0, 128),
+          name: String(m.name || m.id).slice(0, 128),
+          provider: String(m.provider || 'custom').slice(0, 64),
+          ownerKeyId: m.ownerKeyId ? String(m.ownerKeyId).slice(0, 128) : undefined,
+          ownerKeyHint: m.ownerKeyHint ? String(m.ownerKeyHint).slice(0, 64) : undefined,
+          description: m.description ? String(m.description).slice(0, 512) : undefined,
+          updatedAt: new Date().toISOString()
+        }));
       }
     } catch (err) {
       console.warn('Could not persist models to Firestore:', err);
     }
   }, [currentUser, isAdmin]);
 
-  // Admin Bulk Add Provider Keys & Auto-Discover Models (safe JSON parsing)
+  // Admin Bulk Add Provider Keys & Auto-Discover Models (safe JSON parsing + Firestore sync)
   const handleAddBulkProviderKeys = async (keysText: string, provider: string, customBaseUrl?: string) => {
+    const fbToken = await getFirebaseIdToken();
     const res = await fetch('/api/admin/bulk-add-keys', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-user-email': activeEmail || ''
+        'x-user-email': activeEmail || '',
+        ...(fbToken ? { 'x-firebase-token': fbToken } : {})
       },
       body: JSON.stringify({ keysText, provider, customBaseUrl })
     });
@@ -543,7 +617,7 @@ function GatewayApp() {
     }
 
     if (Array.isArray(data.keys)) {
-      const newKeys: ProviderKey[] = data.keys.map((k: any) => ({
+      const upsertedKeys: ProviderKey[] = data.keys.map((k: any) => ({
         id: k.id,
         provider: k.provider,
         key: k.key,
@@ -551,17 +625,24 @@ function GatewayApp() {
         customBaseUrl: k.customBaseUrl,
         status: k.status || 'active',
         supportedModels: k.supportedModels || data.discoveredModelsSummary?.[k.keyHint] || [],
-        requestCount: 0,
-        errorCount: 0,
+        requestCount: k.requestCount || 0,
+        errorCount: k.errorCount || 0,
         lastError: k.lastError,
         createdAt: k.createdAt || new Date().toISOString(),
         updatedAt: k.updatedAt || new Date().toISOString()
       }));
-      setProviderKeys(prev => [...newKeys, ...prev]);
 
-      // Persist new keys & discovered models to Firestore
+      setProviderKeys(prev => {
+        const byId = new Map(prev.map(item => [item.id, item]));
+        for (const k of upsertedKeys) {
+          byId.set(k.id, k);
+        }
+        return Array.from(byId.values());
+      });
+
+      // Persist new/updated keys & discovered models to Firestore
       if (currentUser && isAdmin) {
-        for (const pk of newKeys) {
+        for (const pk of upsertedKeys) {
           try {
             await setDoc(doc(db, 'provider_keys', toFirestoreDocId(pk.id)), sanitizeForFirestore(pk));
           } catch (err) {
@@ -584,12 +665,14 @@ function GatewayApp() {
     const updated = providerKeys.map(k => k.id === keyId ? { ...k, status: newStatus as any, updatedAt: new Date().toISOString() } : k);
     setProviderKeys(updated);
 
+    const fbToken = await getFirebaseIdToken();
     try {
       const res = await fetch(`/api/admin/keys/${encodeURIComponent(keyId)}/status`, {
         method: 'PATCH',
         headers: {
           'Content-Type': 'application/json',
-          'x-user-email': activeEmail || ''
+          'x-user-email': activeEmail || '',
+          ...(fbToken ? { 'x-firebase-token': fbToken } : {})
         },
         body: JSON.stringify({ status: newStatus })
       });
@@ -624,10 +707,14 @@ function GatewayApp() {
     const updated = providerKeys.filter(k => k.id !== keyId);
     setProviderKeys(updated);
 
+    const fbToken = await getFirebaseIdToken();
     try {
       const res = await fetch(`/api/admin/keys/${encodeURIComponent(keyId)}`, {
         method: 'DELETE',
-        headers: { 'x-user-email': activeEmail || '' }
+        headers: {
+          'x-user-email': activeEmail || '',
+          ...(fbToken ? { 'x-firebase-token': fbToken } : {})
+        }
       });
       if (res.ok) {
         const data = await parseJsonSafe(res);
@@ -651,16 +738,50 @@ function GatewayApp() {
     showToast('Key Removed', 'Provider key removed from Master Pool.', 'info');
   };
 
-  const handleResetCooldowns = () => {
-    const updated = providerKeys.map(k => k.status === 'rate_limited' ? { ...k, status: 'active' as const, cooldownUntil: undefined } : k);
+  const handleResetCooldowns = async () => {
+    const updated = providerKeys.map(k =>
+      (k.status === 'rate_limited' || k.status === 'exhausted')
+        ? { ...k, status: 'active' as const, cooldownUntil: undefined, lastError: undefined, updatedAt: new Date().toISOString() }
+        : k
+    );
     setProviderKeys(updated);
-    syncWithBackend(apiKeys, updated, undefined, true);
-    showToast('Cooldowns Cleared', 'All rate-limited provider keys restored.', 'success');
+
+    const fbToken = await getFirebaseIdToken();
+    try {
+      await fetch('/api/admin/keys/reset-cooldowns', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-user-email': activeEmail || '',
+          ...(fbToken ? { 'x-firebase-token': fbToken } : {})
+        }
+      });
+    } catch {
+      syncWithBackend(apiKeys, updated, undefined, true);
+    }
+
+    if (currentUser && isAdmin) {
+      for (const pk of updated) {
+        if (pk.status === 'active') {
+          try {
+            await setDoc(doc(db, 'provider_keys', toFirestoreDocId(pk.id)), sanitizeForFirestore(pk));
+          } catch {
+            // ignore
+          }
+        }
+      }
+    }
+
+    showToast('Cooldowns Cleared', 'All rate-limited and exhausted provider keys restored to active.', 'success');
   };
 
   const handleRefreshModels = async () => {
     try {
-      const res = await fetch('/api/models/refresh', { method: 'POST' });
+      const fbToken = await getFirebaseIdToken();
+      const res = await fetch('/api/models/refresh', {
+        method: 'POST',
+        headers: fbToken ? { 'x-firebase-token': fbToken } : {}
+      });
       const data = await parseJsonSafe(res);
       if (Array.isArray(data.models)) {
         const nextModels: GatewayModel[] = data.models.map((m: any) => ({

@@ -1,20 +1,26 @@
 import { initializeApp, getApps } from 'firebase/app';
-import { 
-  getFirestore, 
-  doc, 
-  getDocFromServer,
-  collection,
-  DocumentReference,
-  CollectionReference
+import {
+  getFirestore,
+  doc,
+  getDocFromServer
 } from 'firebase/firestore';
+import { getDatabase } from 'firebase/database';
 import { getAuth, GoogleAuthProvider, GithubAuthProvider, OAuthProvider } from 'firebase/auth';
 import firebaseConfig from '../../firebase-applet-config.json';
 
-export const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
+const resolvedFirebaseConfig = {
+  ...firebaseConfig,
+  databaseURL: 'https://aisdd-6f89e-default-rtdb.firebaseio.com',
+  measurementId: firebaseConfig.measurementId || 'G-FHF7PB7BTM'
+};
 
-// CRITICAL: The app will break without passing firestoreDatabaseId
+export const app = getApps().length === 0 ? initializeApp(resolvedFirebaseConfig) : getApps()[0];
+
+// CRITICAL: Keep passing firestoreDatabaseId from firebase-applet-config.json
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+export const rtdb = getDatabase(app);
 export const auth = getAuth(app);
+
 export const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: 'select_account' });
 
@@ -82,7 +88,7 @@ export async function testConnection() {
     await getDocFromServer(doc(db, 'test', 'connection'));
   } catch (error) {
     if (error instanceof Error && error.message.includes('the client is offline')) {
-      console.error("Please check your Firebase configuration.");
+      console.error('Please check your Firebase configuration.');
     }
   }
 }

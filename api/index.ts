@@ -4,7 +4,7 @@ import { gatewayApp } from '../server/gateway.js';
 export default function handler(req: IncomingMessage, res: ServerResponse) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, DELETE, PATCH');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key, x-user-email');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key, x-user-email, x-firebase-token');
 
   if (req.method === 'OPTIONS') {
     res.statusCode = 204;

@@ -1,7 +1,7 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Default-deny catch-all
+    // Global default-deny safety net
     match /{document=**} {
       allow read, write: if false;
     }
@@ -11,18 +11,25 @@ service cloud.firestore {
     }
 
     function isVerified() {
-      return isSignedIn() && (request.auth.token.email_verified == true || request.auth.token.firebase.sign_in_provider == 'google.com');
+      return isSignedIn() && (
+        request.auth.token.email_verified == true ||
+        request.auth.token.firebase.sign_in_provider == 'google.com'
+      );
     }
 
     function isAdmin() {
       return isSignedIn() && (
-        request.auth.token.email == 'rouinmajhi@gmail.com' ||
+        (
+          request.auth.token.email is string &&
+          request.auth.token.email.lower() == 'rouinmajhi@gmail.com' &&
+          request.auth.token.email_verified == true
+        ) ||
         exists(/databases/$(database)/documents/admins/$(request.auth.uid))
       );
     }
 
     function isValidId(id) {
-      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
     function incoming() {
@@ -33,20 +40,122 @@ service cloud.firestore {
       return resource.data;
     }
 
-    // User profiles
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['uid', 'email', 'role', 'freeCreditsAllocated', 'freeCreditsSpent']) &&
+        data.keys().hasOnly([
+          'uid', 'email', 'displayName', 'photoURL', 'role',
+          'freeCreditsAllocated', 'freeCreditsSpent', 'totalRequests', 'totalTokens',
+          'createdAt', 'updatedAt'
+        ]) &&
+        data.uid is string && data.uid.size() <= 128 &&
+        data.email is string && data.email.size() <= 256 &&
+        data.role in ['user', 'admin'] &&
+        data.freeCreditsAllocated is number && data.freeCreditsAllocated >= 0 &&
+        data.freeCreditsSpent is number && data.freeCreditsSpent >= 0 &&
+        (!('displayName' in data) || (data.displayName is string && data.displayName.size() <= 128)) &&
+        (!('photoURL' in data) || (data.photoURL is string && data.photoURL.size() <= 512)) &&
+        (!('totalRequests' in data) || (data.totalRequests is number && data.totalRequests >= 0)) &&
+        (!('totalTokens' in data) || (data.totalTokens is number && data.totalTokens >= 0)) &&
+        (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 64)) &&
+        (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64));
+    }
+
+    function isValidApiKey(data) {
+      return data.keys().hasAll(['id', 'userId', 'name', 'key', 'status']) &&
+        data.keys().hasOnly([
+          'id', 'userId', 'name', 'key', 'keyPrefix', 'status',
+          'totalRequests', 'totalTokens', 'createdAt', 'lastUsedAt'
+        ]) &&
+        data.id is string && data.id.size() <= 128 &&
+        data.userId is string && data.userId.size() <= 128 &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 128 &&
+        data.key is string && data.key.size() >= 16 && data.key.size() <= 128 &&
+        data.status in ['active', 'revoked'] &&
+        (!('keyPrefix' in data) || (data.keyPrefix is string && data.keyPrefix.size() <= 32)) &&
+        (!('totalRequests' in data) || (data.totalRequests is number && data.totalRequests >= 0)) &&
+        (!('totalTokens' in data) || (data.totalTokens is number && data.totalTokens >= 0)) &&
+        (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 64)) &&
+        (!('lastUsedAt' in data) || (data.lastUsedAt is string && data.lastUsedAt.size() <= 64));
+    }
+
+    function isValidProviderKey(data) {
+      return data.keys().hasAll(['id', 'provider', 'key', 'status']) &&
+        data.keys().hasOnly([
+          'id', 'provider', 'key', 'keyHint', 'customBaseUrl', 'supportedModels',
+          'status', 'requestCount', 'errorCount', 'lastError', 'cooldownUntil',
+          'lastUsedAt', 'createdAt', 'updatedAt'
+        ]) &&
+        data.id is string && data.id.size() <= 128 &&
+        data.provider is string && data.provider.size() <= 64 &&
+        data.key is string && data.key.size() >= 6 && data.key.size() <= 512 &&
+        data.status in ['active', 'rate_limited', 'exhausted', 'disabled'] &&
+        (!('keyHint' in data) || (data.keyHint is string && data.keyHint.size() <= 32)) &&
+        (!('customBaseUrl' in data) || (data.customBaseUrl is string && data.customBaseUrl.size() <= 512)) &&
+        (!('supportedModels' in data) || (data.supportedModels is list && data.supportedModels.size() <= 1000)) &&
+        (!('requestCount' in data) || (data.requestCount is number && data.requestCount >= 0)) &&
+        (!('errorCount' in data) || (data.errorCount is number && data.errorCount >= 0)) &&
+        (!('lastError' in data) || (data.lastError is string && data.lastError.size() <= 512)) &&
+        (!('cooldownUntil' in data) || data.cooldownUntil is number) &&
+        (!('lastUsedAt' in data) || (data.lastUsedAt is string && data.lastUsedAt.size() <= 64)) &&
+        (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 64)) &&
+        (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64));
+    }
+
+    function isValidGatewayModel(data) {
+      return data.keys().hasAll(['id', 'name', 'provider']) &&
+        data.keys().hasOnly([
+          'id', 'name', 'provider', 'ownerKeyId', 'ownerKeyHint',
+          'contextWindow', 'pricingPrompt', 'pricingCompletion',
+          'activeKeysCount', 'isActive', 'discoveredAt', 'updatedAt', 'description'
+        ]) &&
+        data.id is string && data.id.size() <= 128 &&
+        data.name is string && data.name.size() <= 128 &&
+        data.provider is string && data.provider.size() <= 64 &&
+        (!('ownerKeyId' in data) || (data.ownerKeyId is string && data.ownerKeyId.size() <= 128)) &&
+        (!('ownerKeyHint' in data) || (data.ownerKeyHint is string && data.ownerKeyHint.size() <= 64)) &&
+        (!('contextWindow' in data) || data.contextWindow is number) &&
+        (!('pricingPrompt' in data) || data.pricingPrompt is number) &&
+        (!('pricingCompletion' in data) || data.pricingCompletion is number) &&
+        (!('activeKeysCount' in data) || data.activeKeysCount is number) &&
+        (!('isActive' in data) || data.isActive is bool) &&
+        (!('discoveredAt' in data) || (data.discoveredAt is string && data.discoveredAt.size() <= 64)) &&
+        (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64)) &&
+        (!('description' in data) || (data.description is string && data.description.size() <= 512));
+    }
+
+    function isValidRequestLog(data) {
+      return data.keys().hasAll(['id', 'userId', 'model', 'timestamp']) &&
+        data.keys().hasOnly([
+          'id', 'userId', 'apiKeyId', 'model', 'routedModel', 'provider',
+          'promptTokens', 'completionTokens', 'totalTokens', 'costUsd',
+          'latencyMs', 'status', 'failoverAttempts', 'fallbackRouted', 'timestamp'
+        ]) &&
+        data.id is string && data.id.size() <= 128 &&
+        data.userId is string && data.userId.size() <= 128 &&
+        data.model is string && data.model.size() <= 128 &&
+        data.timestamp is string && data.timestamp.size() <= 64;
+    }
+
+    // User profiles (PII-restricted to owner or admin)
     match /user_profiles/{userId} {
-      allow get: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+      allow get: if isSignedIn() && isValidId(userId) && (request.auth.uid == userId || isAdmin());
       allow list: if isAdmin();
       allow create: if isVerified() && isValidId(userId) && request.auth.uid == userId &&
+        isValidUserProfile(incoming()) &&
         incoming().uid == request.auth.uid &&
-        incoming().email is string && incoming().email.size() <= 256 &&
-        incoming().freeCreditsAllocated is number &&
-        incoming().freeCreditsSpent is number &&
         (incoming().role == 'user' || (incoming().role == 'admin' && isAdmin()));
-      allow update: if isSignedIn() && (request.auth.uid == userId || isAdmin()) &&
+      allow update: if isSignedIn() && isValidId(userId) &&
+        isValidUserProfile(incoming()) &&
+        (request.auth.uid == userId || isAdmin()) &&
         incoming().uid == existing().uid &&
-        (isAdmin() || incoming().role == existing().role);
-      allow delete: if isAdmin();
+        (isAdmin() || (
+          incoming().role == existing().role &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'email', 'displayName', 'photoURL', 'freeCreditsAllocated',
+            'freeCreditsSpent', 'totalRequests', 'totalTokens', 'updatedAt'
+          ])
+        ));
+      allow delete: if isAdmin() && isValidId(userId);
     }
 
     // User Gateway API Keys
@@ -54,26 +163,28 @@ service cloud.firestore {
       allow get: if isSignedIn() && isValidId(apiKeyId) && (existing().userId == request.auth.uid || isAdmin());
       allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
       allow create: if isVerified() && isValidId(apiKeyId) &&
-        incoming().userId == request.auth.uid &&
-        incoming().key is string && incoming().key.size() <= 128 &&
-        incoming().name is string && incoming().name.size() <= 128 &&
-        incoming().status in ['active', 'revoked'];
+        isValidApiKey(incoming()) &&
+        incoming().userId == request.auth.uid;
       allow update: if isSignedIn() && isValidId(apiKeyId) &&
+        isValidApiKey(incoming()) &&
         (existing().userId == request.auth.uid || isAdmin()) &&
-        incoming().userId == existing().userId;
+        incoming().userId == existing().userId &&
+        (isAdmin() || incoming().diff(existing()).affectedKeys().hasOnly(['name', 'status', 'totalRequests', 'totalTokens', 'lastUsedAt']));
       allow delete: if isSignedIn() && isValidId(apiKeyId) && (existing().userId == request.auth.uid || isAdmin());
     }
 
     // Master Key Pool for Providers (Admin only)
     match /provider_keys/{providerKeyId} {
       allow read: if isAdmin();
-      allow create, update, delete: if isAdmin() && isValidId(providerKeyId);
+      allow create, update: if isAdmin() && isValidId(providerKeyId) && isValidProviderKey(incoming());
+      allow delete: if isAdmin() && isValidId(providerKeyId);
     }
 
-    // Dynamic Discovered Models (All authenticated users can read, Admin can manage)
+    // Dynamic Discovered Models (Authenticated users can read, Admin can manage)
     match /models/{modelId} {
       allow read: if isSignedIn();
-      allow create, update, delete: if isAdmin() && isValidId(modelId);
+      allow create, update: if isAdmin() && isValidId(modelId) && isValidGatewayModel(incoming());
+      allow delete: if isAdmin() && isValidId(modelId);
     }
 
     // Telemetry & Request logs
@@ -81,15 +192,15 @@ service cloud.firestore {
       allow get: if isSignedIn() && isValidId(logId) && (existing().userId == request.auth.uid || isAdmin());
       allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
       allow create: if isSignedIn() && isValidId(logId) &&
-        incoming().userId == request.auth.uid &&
-        incoming().model is string && incoming().model.size() <= 128;
-      allow update, delete: if isAdmin();
+        isValidRequestLog(incoming()) &&
+        (incoming().userId == request.auth.uid || isAdmin());
+      allow update, delete: if isAdmin() && isValidId(logId);
     }
 
     // Admins list
     match /admins/{adminUid} {
       allow read: if isSignedIn();
-      allow write: if isAdmin();
+      allow write: if isAdmin() && isValidId(adminUid);
     }
   }
 }

@@ -14,8 +14,8 @@
         "freeCreditsSpent": { "type": "number" },
         "totalRequests": { "type": "number" },
         "totalTokens": { "type": "number" },
-        "createdAt": { "type": "string" },
-        "updatedAt": { "type": "string" }
+        "createdAt": { "type": "string", "maxLength": 64 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
       },
       "required": ["uid", "email", "role", "freeCreditsAllocated", "freeCreditsSpent"]
     },
@@ -32,8 +32,8 @@
         "status": { "type": "string", "enum": ["active", "revoked"] },
         "totalRequests": { "type": "number" },
         "totalTokens": { "type": "number" },
-        "createdAt": { "type": "string" },
-        "lastUsedAt": { "type": "string" }
+        "createdAt": { "type": "string", "maxLength": 64 },
+        "lastUsedAt": { "type": "string", "maxLength": 64 }
       },
       "required": ["id", "userId", "name", "key", "status"]
     },
@@ -53,8 +53,9 @@
         "errorCount": { "type": "number" },
         "lastError": { "type": "string", "maxLength": 512 },
         "cooldownUntil": { "type": "number" },
-        "createdAt": { "type": "string" },
-        "updatedAt": { "type": "string" }
+        "lastUsedAt": { "type": "string", "maxLength": 64 },
+        "createdAt": { "type": "string", "maxLength": 64 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
       },
       "required": ["id", "provider", "key", "status"]
     },
@@ -72,19 +73,23 @@
         "pricingPrompt": { "type": "number" },
         "pricingCompletion": { "type": "number" },
         "activeKeysCount": { "type": "number" },
-        "discoveredAt": { "type": "string" }
+        "isActive": { "type": "boolean" },
+        "discoveredAt": { "type": "string", "maxLength": 64 },
+        "updatedAt": { "type": "string", "maxLength": 64 },
+        "description": { "type": "string", "maxLength": 512 }
       },
       "required": ["id", "name", "provider"]
     },
     "RequestLog": {
       "title": "RequestLog",
-      "description": "Execution log for metrics, token consumption, and analytics",
+      "description": "Execution log for metrics, token consumption, failover telemetry, and analytics",
       "type": "object",
       "properties": {
         "id": { "type": "string", "maxLength": 128 },
         "userId": { "type": "string", "maxLength": 128 },
         "apiKeyId": { "type": "string", "maxLength": 128 },
         "model": { "type": "string", "maxLength": 128 },
+        "routedModel": { "type": "string", "maxLength": 128 },
         "provider": { "type": "string", "maxLength": 64 },
         "promptTokens": { "type": "number" },
         "completionTokens": { "type": "number" },
@@ -92,7 +97,9 @@
         "costUsd": { "type": "number" },
         "latencyMs": { "type": "number" },
         "status": { "type": "number" },
-        "timestamp": { "type": "string" }
+        "failoverAttempts": { "type": "number" },
+        "fallbackRouted": { "type": "boolean" },
+        "timestamp": { "type": "string", "maxLength": 64 }
       },
       "required": ["id", "userId", "model", "timestamp"]
     },
@@ -103,7 +110,7 @@
       "properties": {
         "uid": { "type": "string", "maxLength": 128 },
         "email": { "type": "string", "maxLength": 256 },
-        "addedAt": { "type": "string" }
+        "addedAt": { "type": "string", "maxLength": 64 }
       },
       "required": ["uid", "email"]
     }
