@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { GatewayModel, ProviderKey } from '../types/gateway';
 import { ProviderLogo } from './ProviderLogo';
+import { extractAndCleanKeys } from '../lib/keyDetection';
 
 interface ModelsViewProps {
   models: GatewayModel[];
@@ -41,8 +42,8 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
   // Add Key Modal State
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [inputKeys, setInputKeys] = useState('');
-  const [selectedProvider, setSelectedProvider] = useState('auto');
   const [customBaseUrl, setCustomBaseUrl] = useState('');
+  const [showCustomUrlInput, setShowCustomUrlInput] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [addResult, setAddResult] = useState<{ message: string; isError?: boolean } | null>(null);
@@ -56,43 +57,36 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
     setTimeout(() => setCopiedModelId(null), 2000);
   };
 
+  const livePreview = extractAndCleanKeys(inputKeys, customBaseUrl.trim() || undefined);
+
   const handleAddSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!inputKeys.trim()) return;
 
-    const lines = inputKeys
-      .split(/[\r\n,]+/)
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0 && !l.startsWith('#'));
+    const { keys, maskedFound } = extractAndCleanKeys(inputKeys, customBaseUrl.trim() || undefined);
 
-    for (const line of lines) {
-      if (line.includes('…') || line.includes('...') || line.includes('•')) {
-        setAddResult({
-          message: 'Masked key detected, please paste the full raw API key',
-          isError: true
-        });
-        return;
-      }
-      if (/[^\x21-\x7E]/.test(line)) {
-        setAddResult({
-          message: 'Invalid non-ASCII characters detected. Please paste the full raw API key.',
-          isError: true
-        });
-        return;
-      }
+    if (keys.length === 0) {
+      setAddResult({
+        message: maskedFound
+          ? 'Masked key detected, please paste the full raw API key'
+          : 'Please paste at least one valid API key (e.g. AIza..., sk-..., gsk_...).',
+        isError: true
+      });
+      return;
     }
 
     setIsSubmitting(true);
     setAddResult(null);
 
     try {
-      const res = await onAddKeyAndFetchModels(inputKeys, selectedProvider, customBaseUrl.trim() || undefined);
+      const res = await onAddKeyAndFetchModels(keys.join('\n'), 'auto', customBaseUrl.trim() || undefined);
       setAddResult({
         message: `Success! Added ${res.addedCount} key(s) and discovered ${res.modelsCount} model(s).`,
         isError: false
       });
       setInputKeys('');
       setCustomBaseUrl('');
+      setShowCustomUrlInput(false);
       setTimeout(() => {
         setIsAddModalOpen(false);
         setAddResult(null);
@@ -393,51 +387,28 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
             </div>
 
             <form onSubmit={handleAddSubmit} className="space-y-4 mt-4">
-              <div>
-                <label className="block text-xs font-medium text-zinc-700 mb-1.5">
-                  Target Provider
-                </label>
-                <select
-                  value={selectedProvider}
-                  onChange={(e) => {
-                    const next = e.target.value;
-                    setSelectedProvider(next);
-                    if (next === 'inception' && !customBaseUrl) {
-                      setCustomBaseUrl('https://api.inceptionlabs.ai/v1');
-                    } else if (next !== 'custom' && next !== 'inception') {
-                      setCustomBaseUrl('');
-                    }
-                  }}
-                  className="w-full px-3 py-2 text-xs rounded-lg border border-zinc-200 bg-white outline-none focus:border-violet-600 font-medium text-zinc-800"
-                >
-                  <option value="auto">Auto-Detect by Key Prefix (Recommended)</option>
-                  <option value="inception">Inception Labs (Mercury)</option>
-                  <option value="groq">Groq (keys start with gsk_)</option>
-                  <option value="openai">OpenAI (keys start with sk-...)</option>
-                  <option value="gemini">Google Gemini (keys start with AIzaSy...)</option>
-                  <option value="openrouter">OpenRouter (keys start with sk-or-...)</option>
-                  <option value="deepseek">DeepSeek (keys start with sk-...)</option>
-                  <option value="mistral">Mistral (32-character token)</option>
-                  <option value="cerebras">Cerebras (keys start with csk-...)</option>
-                  <option value="anthropic">Anthropic (keys start with sk-ant-...)</option>
-                  <option value="custom">Custom OpenAI-Compatible Endpoint</option>
-                </select>
-              </div>
-
-              {(selectedProvider === 'custom' || selectedProvider === 'inception') && (
-                <div>
-                  <label className="block text-xs font-medium text-zinc-700 mb-1.5">
-                    Provider Base URL
-                  </label>
-                  <input
-                    type="url"
-                    value={customBaseUrl}
-                    onChange={(e) => setCustomBaseUrl(e.target.value)}
-                    placeholder="https://api.inceptionlabs.ai/v1"
-                    className="w-full px-3 py-2 font-mono text-xs rounded-lg border border-zinc-200 focus:border-violet-600 outline-none bg-zinc-50"
-                  />
+              <div className="rounded-xl bg-violet-50/70 border border-violet-200/70 p-3 text-xs">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-semibold text-violet-900">Automatic Provider Detection</span>
+                  <span className="text-[11px] font-mono text-violet-700">{livePreview.keys.length} key(s) ready</span>
                 </div>
-              )}
+                <p className="text-[11px] text-violet-700/90 mt-1">
+                  Auto-detects <code className="font-mono">AIza...</code> (Gemini), <code className="font-mono">gsk_...</code> (Groq), <code className="font-mono">sk-or-...</code> (OpenRouter), <code className="font-mono">sk-...</code> (OpenAI/DeepSeek) and fetches models immediately.
+                </p>
+                {livePreview.entries.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5 mt-2 pt-2 border-t border-violet-200/60">
+                    {livePreview.entries.slice(0, 5).map((entry) => (
+                      <span
+                        key={entry.raw}
+                        className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-white border border-violet-200 text-[11px] font-medium text-zinc-800"
+                      >
+                        <ProviderLogo provider={entry.provider} size={12} />
+                        <span>{entry.providerLabel}</span>
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
 
               <div>
                 <div className="flex items-center justify-between mb-1.5">
@@ -450,10 +421,31 @@ export const ModelsView: React.FC<ModelsViewProps> = ({
                   rows={4}
                   value={inputKeys}
                   onChange={(e) => setInputKeys(e.target.value)}
-                  placeholder={`Paste one or multiple keys:\ngsk_sample_groq_key_9201a...\nsk-proj-sample_openai_key_84bc...\nAIzaSySampleGeminiKey_47xz...`}
+                  placeholder={`Paste one or multiple keys:\ngsk_...\nsk-proj-...\nAIzaSy...`}
                   className="w-full p-3 font-mono text-xs rounded-xl border border-zinc-200 focus:border-violet-600 outline-none resize-none bg-zinc-50"
                   required
                 />
+              </div>
+
+              <div>
+                <button
+                  type="button"
+                  onClick={() => setShowCustomUrlInput((prev) => !prev)}
+                  className="text-[11px] font-medium text-zinc-500 hover:text-violet-700 transition-colors cursor-pointer"
+                >
+                  {showCustomUrlInput ? '− Hide Optional Custom Base URL' : '+ Optional: Custom Base URL'}
+                </button>
+                {showCustomUrlInput && (
+                  <div className="mt-2">
+                    <input
+                      type="url"
+                      value={customBaseUrl}
+                      onChange={(e) => setCustomBaseUrl(e.target.value)}
+                      placeholder="https://api.inceptionlabs.ai/v1"
+                      className="w-full px-3 py-2 font-mono text-xs rounded-lg border border-zinc-200 focus:border-violet-600 outline-none bg-zinc-50"
+                    />
+                  </div>
+                )}
               </div>
 
               {addResult && (

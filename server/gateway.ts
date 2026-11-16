@@ -395,16 +395,81 @@ export function detectProviderByKey(key: string, customBaseUrl?: string): Suppor
   }
 
   const trimmed = key.trim();
+  if (trimmed.startsWith('AIza')) return 'gemini';
   if (trimmed.startsWith('gsk_')) return 'groq';
   if (trimmed.startsWith('sk-or-')) return 'openrouter';
   if (trimmed.startsWith('sk-ant-')) return 'anthropic';
   if (trimmed.startsWith('csk-')) return 'cerebras';
-  if (trimmed.startsWith('AIzaSy')) return 'gemini';
-  if (trimmed.startsWith('sk-proj-') || trimmed.startsWith('sk-admin-')) return 'openai';
+  if (trimmed.startsWith('sk-proj-') || trimmed.startsWith('sk-admin-') || trimmed.startsWith('sk-svcacct-')) {
+    return 'openai';
+  }
+  if (trimmed.startsWith('sk_')) return 'inception';
   if (trimmed.startsWith('sk-') && trimmed.length > 40) return 'openai';
-  if (trimmed.startsWith('sk-') && trimmed.length <= 40) return 'deepseek';
+  if (trimmed.startsWith('sk-')) return 'deepseek';
   if (/^[a-zA-Z0-9]{32}$/.test(trimmed)) return 'mistral';
   return 'custom';
+}
+
+export function cleanRawApiKeyToken(raw: string): string {
+  return String(raw || '')
+    .replace(/[\u200B-\u200F\u202A-\u202E\u2060\uFEFF\u00AD]/g, '')
+    .replace(/[\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]/g, ' ')
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/[\u2018\u2019]/g, "'")
+    .trim()
+    .replace(/^(authorization\s*:\s*)?bearer\s+/i, '')
+    .replace(/^["'`(\[{<]+|["'`)\]}>]+$/g, '')
+    .replace(/[^\x21-\x7E]/g, '')
+    .trim();
+}
+
+export function sanitizeAndExtractBulkKeys(rawText: string): { keys: string[]; maskedFound: boolean } {
+  const normalized = String(rawText || '')
+    .replace(/[\u200B-\u200F\u202A-\u202E\u2060\uFEFF\u00AD]/g, '')
+    .replace(/[\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]/g, ' ')
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/[\u2018\u2019]/g, "'");
+
+  const lines = normalized.split(/[\r\n]+/);
+  const seen = new Set<string>();
+  const keys: string[] = [];
+  let maskedFound = false;
+
+  for (let line of lines) {
+    line = line.trim();
+    if (!line || line.startsWith('#') || line.startsWith('//')) continue;
+
+    line = line.replace(/^([-*•]|\d+[.)])\s+/, '').trim();
+    line = line.replace(/^export\s+/i, '').trim();
+
+    const envMatch = line.match(/^[A-Za-z_][A-Za-z0-9_]*\s*=\s*(.+)$/);
+    if (envMatch) {
+      line = envMatch[1].trim();
+    }
+
+    line = line.replace(/^(authorization\s*:\s*)?bearer\s+/i, '').trim();
+
+    const tokens = line.split(/[\s,;]+/);
+    for (let token of tokens) {
+      token = token.replace(/^["'`(\[{<]+|["'`)\]}>]+$/g, '').trim();
+      if (!token) continue;
+      if (/^(bearer|api_key|apikey|key|token|authorization|header|curl|-h|--header)$/i.test(token)) {
+        continue;
+      }
+      if (token.includes('…') || token.includes('...') || /\*{4,}|•{2,}/.test(token)) {
+        maskedFound = true;
+        continue;
+      }
+      const cleanAscii = token.replace(/[^\x21-\x7E]/g, '');
+      if (cleanAscii.length < 6) continue;
+      if (!seen.has(cleanAscii)) {
+        seen.add(cleanAscii);
+        keys.push(cleanAscii);
+      }
+    }
+  }
+
+  return { keys, maskedFound };
 }
 
 /**
@@ -434,7 +499,9 @@ export function rebuildMasterModelsFromPool(): void {
         pricingPrompt: prevMeta?.pricingPrompt,
         pricingCompletion: prevMeta?.pricingCompletion,
         activeKeysCount: keyCounts.get(modelId),
+        isActive: true,
         discoveredAt: prevMeta?.discoveredAt || pk.updatedAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
         description: prevMeta?.description
       });
     }
@@ -448,14 +515,90 @@ export function rebuildMasterModelsFromPool(): void {
 }
 
 export function isMaskedOrInvalidHeaderKey(rawKey: string): string | null {
-  const trimmed = rawKey.trim();
-  if (trimmed.includes('…') || trimmed.includes('...') || trimmed.includes('•')) {
+  const trimmed = String(rawKey || '').trim();
+  if (trimmed.includes('…') || trimmed.includes('...') || /\*{4,}|•{2,}/.test(trimmed)) {
     return 'Masked key detected, please paste the full raw API key';
   }
-  if (/[^\x21-\x7E]/.test(trimmed)) {
-    return 'Invalid non-ASCII or whitespace characters detected in API key. Please paste the full raw ASCII API key.';
+  const cleanAscii = cleanRawApiKeyToken(trimmed);
+  if (cleanAscii.length < 6) {
+    return 'API key appears empty or too short. Please paste the full raw API key.';
   }
   return null;
+}
+
+export async function discoverModelsWithAutoProbe(
+  initialProvider: SupportedProvider,
+  rawKey: string,
+  customBaseUrl?: string,
+  ownerKeyId?: string,
+  ownerKeyHint?: string,
+  allowAutoProbe = true,
+  mutateCatalog = true
+): Promise<{ provider: SupportedProvider; models: string[] }> {
+  const cleanKey = cleanRawApiKeyToken(rawKey);
+  const normalizedUrl = normalizeBaseUrl(customBaseUrl);
+
+  if (normalizedUrl || !allowAutoProbe) {
+    const models = await fetchUpstreamModels(
+      initialProvider,
+      cleanKey,
+      normalizedUrl,
+      ownerKeyId,
+      ownerKeyHint,
+      mutateCatalog
+    );
+    return { provider: initialProvider, models };
+  }
+
+  // Build ordered candidate list for auto-detection when prefix is shared across providers (e.g. sk-...)
+  const candidates: SupportedProvider[] = [initialProvider];
+  if (
+    cleanKey.startsWith('sk-') &&
+    !cleanKey.startsWith('sk-or-') &&
+    !cleanKey.startsWith('sk-ant-') &&
+    !cleanKey.startsWith('sk-proj-') &&
+    !cleanKey.startsWith('sk-admin-') &&
+    !cleanKey.startsWith('sk-svcacct-')
+  ) {
+    for (const p of ['openai', 'deepseek', 'openrouter', 'inception', 'groq', 'mistral'] as SupportedProvider[]) {
+      if (!candidates.includes(p)) candidates.push(p);
+    }
+  } else if (cleanKey.startsWith('sk_')) {
+    for (const p of ['inception', 'openai', 'openrouter'] as SupportedProvider[]) {
+      if (!candidates.includes(p)) candidates.push(p);
+    }
+  } else if (/^[a-zA-Z0-9]{32}$/.test(cleanKey)) {
+    for (const p of ['mistral', 'inception'] as SupportedProvider[]) {
+      if (!candidates.includes(p)) candidates.push(p);
+    }
+  } else if (initialProvider === 'custom') {
+    for (const p of ['inception', 'mistral', 'openai', 'openrouter', 'deepseek', 'groq'] as SupportedProvider[]) {
+      if (!candidates.includes(p)) candidates.push(p);
+    }
+  }
+
+  let primaryError: Error | null = null;
+  for (const candidate of candidates) {
+    try {
+      const models = await fetchUpstreamModels(
+        candidate,
+        cleanKey,
+        undefined,
+        ownerKeyId,
+        ownerKeyHint,
+        mutateCatalog
+      );
+      if (models.length > 0) {
+        return { provider: candidate, models };
+      }
+    } catch (err: any) {
+      if (!primaryError) {
+        primaryError = err instanceof Error ? err : new Error(String(err));
+      }
+    }
+  }
+
+  throw primaryError || new Error(`Failed to discover models for ${initialProvider}`);
 }
 
 /**
@@ -469,7 +612,7 @@ export async function fetchUpstreamModels(
   ownerKeyHint?: string,
   mutateCatalog = true
 ): Promise<string[]> {
-  const cleanKey = apiKey.trim();
+  const cleanKey = cleanRawApiKeyToken(apiKey);
   const keyValidationError = isMaskedOrInvalidHeaderKey(cleanKey);
   if (keyValidationError) {
     throw new Error(keyValidationError);
@@ -1444,36 +1587,30 @@ const handleBulkAddKeys = async (req: Request, res: Response) => {
       return;
     }
 
-    const lines = keysText
-      .split(/[\r\n,]+/)
-      .map((line: string) => line.trim())
-      .filter((line: string) => line.length > 5 && !line.startsWith('#'));
+    const { keys: lines, maskedFound } = sanitizeAndExtractBulkKeys(keysText);
 
     if (lines.length === 0) {
-      res.status(400).json({ error: 'No valid keys detected in input.' });
+      res.status(400).json({
+        error: maskedFound
+          ? 'Masked key detected, please paste the full raw API key'
+          : 'No valid keys detected in input.'
+      });
       return;
     }
 
-    for (const rawKey of lines) {
-      const invalidReason = isMaskedOrInvalidHeaderKey(rawKey);
-      if (invalidReason) {
-        res.status(400).json({ error: invalidReason });
-        return;
-      }
-    }
-
     const normalizedCustomUrl = normalizeBaseUrl(customBaseUrl);
+    const isAutoProvider = !provider || provider === 'auto';
     const addedKeys: StoredProviderKey[] = [];
     const discoveredModelsSummary: Record<string, string[]> = {};
     const discoveryErrors: Record<string, string> = {};
 
     for (const rawKey of lines) {
       const targetProvider: SupportedProvider =
-        (provider && provider !== 'auto')
-          ? provider
+        !isAutoProvider
+          ? (provider as SupportedProvider)
           : detectProviderByKey(rawKey, normalizedCustomUrl);
 
-      const hint = rawKey.length > 8 ? `${rawKey.slice(0, 4)}...${rawKey.slice(-4)}` : rawKey;
+      const hint = (rawKey.length > 8 ? `${rawKey.slice(0, 4)}...${rawKey.slice(-4)}` : rawKey).slice(0, 32);
       const existingRecord = masterProviderKeys.find(k => k.key === rawKey);
       const keyId = existingRecord ? existingRecord.id : ('pk_' + Math.random().toString(36).substring(2, 11));
 
@@ -1500,13 +1637,22 @@ const handleBulkAddKeys = async (req: Request, res: Response) => {
       }
 
       try {
-        const models = await fetchUpstreamModels(targetProvider, rawKey, keyRecord.customBaseUrl, keyId, hint);
-        keyRecord.supportedModels = models;
+        const discovered = await discoverModelsWithAutoProbe(
+          targetProvider,
+          rawKey,
+          keyRecord.customBaseUrl,
+          keyId,
+          hint,
+          isAutoProvider,
+          true
+        );
+        keyRecord.provider = discovered.provider;
+        keyRecord.supportedModels = discovered.models;
         keyRecord.lastError = undefined;
         keyRecord.errorCount = 0;
-        discoveredModelsSummary[hint] = models;
+        discoveredModelsSummary[hint] = discovered.models;
       } catch (err: any) {
-        const errMsg = err?.message || 'Failed to query upstream /models endpoint';
+        const errMsg = String(err?.message || 'Failed to query upstream /models endpoint').slice(0, 500);
         console.warn(`[FreeAIModel] Model fetch for ${hint} failed:`, errMsg);
         keyRecord.lastError = errMsg;
         keyRecord.errorCount = (keyRecord.errorCount || 0) + 1;
@@ -1688,22 +1834,32 @@ gatewayApp.post('/api/admin/test-key', checkOptionalAdminHeader, async (req: Req
     res.status(400).json({ error: 'Key is required' });
     return;
   }
-  const invalidReason = isMaskedOrInvalidHeaderKey(key);
+  const cleanKey = cleanRawApiKeyToken(key);
+  const invalidReason = isMaskedOrInvalidHeaderKey(cleanKey);
   if (invalidReason) {
     res.status(400).json({ success: false, error: invalidReason });
     return;
   }
-  const targetProvider = (provider && provider !== 'auto') ? provider : detectProviderByKey(key, customBaseUrl);
+  const isAuto = !provider || provider === 'auto';
+  const targetProvider = !isAuto ? (provider as SupportedProvider) : detectProviderByKey(cleanKey, customBaseUrl);
   const start = Date.now();
 
   try {
-    const models = await fetchUpstreamModels(targetProvider, key, customBaseUrl, undefined, undefined, false);
+    const discovered = await discoverModelsWithAutoProbe(
+      targetProvider,
+      cleanKey,
+      customBaseUrl,
+      undefined,
+      undefined,
+      isAuto,
+      false
+    );
     res.json({
       success: true,
-      provider: targetProvider,
+      provider: discovered.provider,
       latencyMs: Date.now() - start,
-      modelsFound: models.length,
-      sampleModels: models.slice(0, 5)
+      modelsFound: discovered.models.length,
+      sampleModels: discovered.models.slice(0, 5)
     });
   } catch (err: any) {
     res.json({

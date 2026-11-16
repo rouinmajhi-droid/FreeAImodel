@@ -418,7 +418,6 @@ export async function syncModelsInFirestore(
     );
   }
 
-  // Upsert in small parallel batches to avoid connection spikes
   const chunkSize = 15;
   for (let i = 0; i < models.length; i += chunkSize) {
     const batch = models.slice(i, i + chunkSize);
@@ -428,7 +427,7 @@ export async function syncModelsInFirestore(
           'models',
           m.id,
           {
-            id: m.id,
+            id: String(m.id).slice(0, 128),
             name: String(m.name || m.id).slice(0, 128),
             provider: String(m.provider || 'custom').slice(0, 64),
             ownerKeyId: m.ownerKeyId ? String(m.ownerKeyId).slice(0, 128) : undefined,
@@ -436,7 +435,7 @@ export async function syncModelsInFirestore(
             contextWindow: typeof m.contextWindow === 'number' ? m.contextWindow : undefined,
             activeKeysCount: typeof m.activeKeysCount === 'number' ? m.activeKeysCount : undefined,
             isActive: true,
-            discoveredAt: m.discoveredAt || new Date().toISOString(),
+            discoveredAt: String(m.discoveredAt || new Date().toISOString()).slice(0, 64),
             updatedAt: new Date().toISOString()
           },
           token

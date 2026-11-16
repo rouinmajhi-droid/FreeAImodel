@@ -7,6 +7,7 @@ import {
   deleteDoc,
   collection,
   getDocs,
+  onSnapshot,
   query,
   where
 } from 'firebase/firestore';
@@ -421,6 +422,30 @@ function GatewayApp() {
     };
   }, [currentUser, isAdmin, syncWithBackend]);
 
+  // Real-time Firestore listener so User Panel automatically receives synced models
+  useEffect(() => {
+    if (!currentUser) return;
+    const unsubscribe = onSnapshot(
+      collection(db, 'models'),
+      (snapshot) => {
+        const liveModels = snapshot.docs
+          .map((d) => d.data() as GatewayModel)
+          .filter((m) => Boolean(m?.id && m?.ownerKeyId));
+        if (liveModels.length > 0) {
+          setModels(liveModels);
+        }
+      },
+      (error) => {
+        try {
+          handleFirestoreError(error, OperationType.GET, 'models');
+        } catch {
+          // Non-blocking fallback if rules reject
+        }
+      }
+    );
+    return () => unsubscribe();
+  }, [currentUser]);
+
   // Dev Quick Login for testing inside sandboxes
   const handleDevQuickLogin = (email: string, displayName: string) => {
     const isAdm = isUserAdmin(email);
@@ -618,18 +643,20 @@ function GatewayApp() {
 
     if (Array.isArray(data.keys)) {
       const upsertedKeys: ProviderKey[] = data.keys.map((k: any) => ({
-        id: k.id,
-        provider: k.provider,
-        key: k.key,
-        keyHint: k.keyHint,
-        customBaseUrl: k.customBaseUrl,
+        id: String(k.id).slice(0, 128),
+        provider: String(k.provider || 'custom').slice(0, 64) as any,
+        key: String(k.key).slice(0, 512),
+        keyHint: k.keyHint ? String(k.keyHint).slice(0, 32) : undefined,
+        customBaseUrl: k.customBaseUrl ? String(k.customBaseUrl).slice(0, 512) : undefined,
         status: k.status || 'active',
-        supportedModels: k.supportedModels || data.discoveredModelsSummary?.[k.keyHint] || [],
-        requestCount: k.requestCount || 0,
-        errorCount: k.errorCount || 0,
-        lastError: k.lastError,
-        createdAt: k.createdAt || new Date().toISOString(),
-        updatedAt: k.updatedAt || new Date().toISOString()
+        supportedModels: Array.isArray(k.supportedModels)
+          ? k.supportedModels.slice(0, 1000)
+          : (data.discoveredModelsSummary?.[k.keyHint] || []).slice(0, 1000),
+        requestCount: typeof k.requestCount === 'number' ? k.requestCount : 0,
+        errorCount: typeof k.errorCount === 'number' ? k.errorCount : 0,
+        lastError: k.lastError ? String(k.lastError).slice(0, 500) : undefined,
+        createdAt: String(k.createdAt || new Date().toISOString()).slice(0, 64),
+        updatedAt: String(k.updatedAt || new Date().toISOString()).slice(0, 64)
       }));
 
       setProviderKeys(prev => {
@@ -646,7 +673,11 @@ function GatewayApp() {
           try {
             await setDoc(doc(db, 'provider_keys', toFirestoreDocId(pk.id)), sanitizeForFirestore(pk));
           } catch (err) {
-            console.warn('Could not persist provider_key to Firestore:', err);
+            try {
+              handleFirestoreError(err, OperationType.WRITE, `provider_keys/${pk.id}`);
+            } catch {
+              // Non-blocking fallback
+            }
           }
         }
         await syncModelsToFirestore(nextModels);

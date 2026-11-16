@@ -21,6 +21,7 @@ import { ProviderKey, GatewayModel, RequestLog } from '../types/gateway';
 import { useToast } from './Toast';
 import { ProviderLogo } from './ProviderLogo';
 import { parseJsonSafe } from '../lib/http';
+import { extractAndCleanKeys } from '../lib/keyDetection';
 
 type AdminSection = 'pool' | 'models' | 'logs';
 
@@ -69,8 +70,8 @@ export const StandaloneAdminDashboard: React.FC<StandaloneAdminDashboardProps> =
   // Bulk Ingestion Modal
   const [isBulkModalOpen, setIsBulkModalOpen] = useState(false);
   const [bulkKeysText, setBulkKeysText] = useState('');
-  const [selectedProvider, setSelectedProvider] = useState<string>('auto');
   const [customBaseUrl, setCustomBaseUrl] = useState<string>('');
+  const [showCustomUrlInput, setShowCustomUrlInput] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isSyncingAll, setIsSyncingAll] = useState(false);
 
@@ -124,39 +125,37 @@ export const StandaloneAdminDashboard: React.FC<StandaloneAdminDashboardProps> =
     );
   }
 
+  const livePreview = extractAndCleanKeys(bulkKeysText, customBaseUrl.trim() || undefined);
+
   const handleBulkSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!bulkKeysText.trim()) return;
 
-    const lines = bulkKeysText
-      .split(/[\r\n,]+/)
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0 && !l.startsWith('#'));
+    const { keys, maskedFound } = extractAndCleanKeys(bulkKeysText, customBaseUrl.trim() || undefined);
 
-    for (const line of lines) {
-      if (line.includes('…') || line.includes('...') || line.includes('•')) {
+    if (keys.length === 0) {
+      if (maskedFound) {
         showToast(
           'Masked Key Detected',
-          'Masked key detected, please paste the full raw API key',
+          'Masked key detected, please paste the full raw API key.',
           'error'
         );
-        return;
-      }
-      if (/[^\x21-\x7E]/.test(line)) {
+      } else {
         showToast(
-          'Invalid Characters',
-          'API keys must contain valid ASCII characters only. Please paste the full raw API key.',
+          'No Valid Keys Found',
+          'Please paste at least one full API key (e.g. AIza..., sk-..., gsk_...).',
           'error'
         );
-        return;
       }
+      return;
     }
 
     setIsSubmitting(true);
     try {
-      const res = await onAddBulkKeys(bulkKeysText, selectedProvider, customBaseUrl.trim() || undefined);
+      const res = await onAddBulkKeys(keys.join('\n'), 'auto', customBaseUrl.trim() || undefined);
       setBulkKeysText('');
       setCustomBaseUrl('');
+      setShowCustomUrlInput(false);
       setIsBulkModalOpen(false);
 
       const errorEntries = res.discoveryErrors ? Object.entries(res.discoveryErrors) : [];
@@ -828,65 +827,74 @@ export const StandaloneAdminDashboard: React.FC<StandaloneAdminDashboardProps> =
               </div>
 
               <div className="space-y-4 mt-5">
-                <div>
-                  <label className="block text-xs font-semibold text-zinc-700 mb-1.5">
-                    Provider Type
-                  </label>
-                  <select
-                    value={selectedProvider}
-                    onChange={(e) => {
-                      const next = e.target.value;
-                      setSelectedProvider(next);
-                      if (next === 'inception' && !customBaseUrl) {
-                        setCustomBaseUrl('https://api.inceptionlabs.ai/v1');
-                      } else if (next !== 'custom' && next !== 'inception') {
-                        setCustomBaseUrl('');
-                      }
-                    }}
-                    className="w-full px-3 py-2 rounded-lg border border-zinc-200 text-xs font-medium bg-white focus:border-violet-600 outline-none text-zinc-700"
-                  >
-                    <option value="auto">Auto-Detect by Key Prefix (gsk_, sk-, AIzaSy...)</option>
-                    <option value="inception">Inception Labs (Mercury)</option>
-                    <option value="groq">Groq (gsk_...)</option>
-                    <option value="openai">OpenAI (sk-...)</option>
-                    <option value="gemini">Google Gemini (AIzaSy...)</option>
-                    <option value="openrouter">OpenRouter (sk-or-...)</option>
-                    <option value="deepseek">DeepSeek (sk-...)</option>
-                    <option value="mistral">Mistral</option>
-                    <option value="cerebras">Cerebras (csk-...)</option>
-                    <option value="anthropic">Anthropic (sk-ant-...)</option>
-                    <option value="custom">Custom OpenAI-Compatible Endpoint</option>
-                  </select>
-                </div>
-
-                {(selectedProvider === 'custom' || selectedProvider === 'inception') && (
-                  <div>
-                    <label className="block text-xs font-semibold text-zinc-700 mb-1.5">
-                      Provider Base URL (for /models discovery &amp; routing)
-                    </label>
-                    <input
-                      type="url"
-                      value={customBaseUrl}
-                      onChange={(e) => setCustomBaseUrl(e.target.value)}
-                      placeholder="https://api.inceptionlabs.ai/v1"
-                      className="w-full px-3 py-2 font-mono text-xs rounded-lg border border-zinc-200 focus:border-violet-600 outline-none"
-                    />
+                <div className="rounded-xl bg-violet-50/70 border border-violet-200/70 p-3 text-xs">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-semibold text-violet-900 flex items-center gap-1.5">
+                      <Zap className="w-3.5 h-3.5 text-violet-600" />
+                      Automatic Provider Detection Active
+                    </span>
+                    <span className="text-[11px] font-mono text-violet-700">
+                      {livePreview.keys.length} key(s) ready
+                    </span>
                   </div>
-                )}
+                  <p className="text-[11px] text-violet-700/90 mt-1">
+                    Paste keys from any provider (<code className="font-mono">AIza...</code> Gemini, <code className="font-mono">gsk_...</code> Groq, <code className="font-mono">sk-or-...</code> OpenRouter, <code className="font-mono">sk-...</code> OpenAI/DeepSeek). Format &amp; models are detected automatically.
+                  </p>
+                  {livePreview.entries.length > 0 && (
+                    <div className="flex flex-wrap gap-1.5 mt-2.5 pt-2 border-t border-violet-200/60">
+                      {livePreview.entries.slice(0, 6).map((entry) => (
+                        <span
+                          key={entry.raw}
+                          className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-white border border-violet-200 text-[11px] font-medium text-zinc-800"
+                        >
+                          <ProviderLogo provider={entry.provider} size={12} />
+                          <span>{entry.providerLabel}</span>
+                          <span className="text-zinc-400 font-mono text-[10px]">{entry.hint}</span>
+                        </span>
+                      ))}
+                      {livePreview.entries.length > 6 && (
+                        <span className="px-2 py-0.5 text-[11px] font-semibold text-violet-700">
+                          +{livePreview.entries.length - 6} more
+                        </span>
+                      )}
+                    </div>
+                  )}
+                </div>
 
                 <div>
                   <label className="block text-xs font-semibold text-zinc-700 mb-1.5 flex items-center justify-between">
-                    <span>API Keys (One per line)</span>
-                    <span className="text-[11px] text-violet-700 font-mono">Appends line-by-line</span>
+                    <span>API Keys (One per line or space/comma separated)</span>
+                    <span className="text-[11px] text-violet-700 font-mono">Auto-cleans quotes &amp; Bearer</span>
                   </label>
                   <textarea
                     rows={6}
                     required
                     value={bulkKeysText}
                     onChange={(e) => setBulkKeysText(e.target.value)}
-                    placeholder={`Paste provider API keys here (one per line)...`}
+                    placeholder={`Paste one or more raw API keys (mixed providers supported):\nAIzaSy...\ngsk_...\nsk-or-v1-...\nsk-proj-...`}
                     className="w-full p-3 font-mono text-xs rounded-lg border border-zinc-200 focus:border-violet-600 outline-none"
                   />
+                </div>
+
+                <div>
+                  <button
+                    type="button"
+                    onClick={() => setShowCustomUrlInput((prev) => !prev)}
+                    className="text-[11px] font-semibold text-zinc-500 hover:text-violet-700 transition-colors cursor-pointer"
+                  >
+                    {showCustomUrlInput ? '− Hide Optional Custom Base URL' : '+ Optional: Custom OpenAI-Compatible Base URL'}
+                  </button>
+                  {showCustomUrlInput && (
+                    <div className="mt-2">
+                      <input
+                        type="url"
+                        value={customBaseUrl}
+                        onChange={(e) => setCustomBaseUrl(e.target.value)}
+                        placeholder="https://api.inceptionlabs.ai/v1 (leave blank for automatic)"
+                        className="w-full px-3 py-2 font-mono text-xs rounded-lg border border-zinc-200 focus:border-violet-600 outline-none"
+                      />
+                    </div>
+                  )}
                 </div>
               </div>
 
