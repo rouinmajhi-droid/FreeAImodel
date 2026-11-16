@@ -8,6 +8,7 @@ import {
   collection,
   getDocs,
   onSnapshot,
+  writeBatch,
   query,
   where
 } from 'firebase/firestore';
@@ -113,11 +114,11 @@ function GatewayApp() {
     }
   };
 
-  // Helper to strip undefined fields before writing to Firestore
+  // Helper to strip undefined and null fields before writing to Firestore
   const sanitizeForFirestore = <T extends Record<string, any>>(obj: T): Partial<T> => {
     const clean: Record<string, any> = {};
     for (const [k, v] of Object.entries(obj)) {
-      if (v !== undefined) clean[k] = v;
+      if (v !== undefined && v !== null) clean[k] = v;
     }
     return clean as Partial<T>;
   };
@@ -125,6 +126,55 @@ function GatewayApp() {
   const toFirestoreDocId = (rawId: string): string => {
     const sanitized = rawId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 128);
     return sanitized || 'id_' + Math.random().toString(36).substring(2, 10);
+  };
+
+  // Strict allowlist + size sanitization matching firestore.rules isValidProviderKey
+  const buildSafeProviderKeyDoc = (pk: ProviderKey): Record<string, any> => {
+    const nowIso = new Date().toISOString().slice(0, 64);
+    const keyStr = String(pk.key || '').slice(0, 512);
+    const hint = (pk.keyHint || (keyStr.length > 8 ? `${keyStr.slice(0, 4)}...${keyStr.slice(-4)}` : keyStr)).slice(0, 32);
+    const validStatus = ['active', 'rate_limited', 'exhausted', 'disabled'].includes(pk.status)
+      ? pk.status
+      : 'active';
+
+    return sanitizeForFirestore({
+      id: toFirestoreDocId(String(pk.id || 'pk_key')).slice(0, 128),
+      provider: String(pk.provider || 'custom').slice(0, 64),
+      key: keyStr,
+      keyHint: hint || undefined,
+      customBaseUrl: pk.customBaseUrl ? String(pk.customBaseUrl).slice(0, 512) : undefined,
+      supportedModels: Array.isArray(pk.supportedModels)
+        ? pk.supportedModels.map(String).slice(0, 1000)
+        : [],
+      status: validStatus,
+      requestCount: typeof pk.requestCount === 'number' && pk.requestCount >= 0 ? pk.requestCount : 0,
+      errorCount: typeof pk.errorCount === 'number' && pk.errorCount >= 0 ? pk.errorCount : 0,
+      lastError: pk.lastError ? String(pk.lastError).slice(0, 500) : undefined,
+      cooldownUntil: typeof pk.cooldownUntil === 'number' ? pk.cooldownUntil : undefined,
+      lastUsedAt: pk.lastUsedAt ? String(pk.lastUsedAt).slice(0, 64) : undefined,
+      createdAt: String(pk.createdAt || nowIso).slice(0, 64),
+      updatedAt: String(pk.updatedAt || nowIso).slice(0, 64)
+    });
+  };
+
+  // Strict allowlist + size sanitization matching firestore.rules isValidGatewayModel
+  const buildSafeModelDoc = (m: GatewayModel): Record<string, any> => {
+    const nowIso = new Date().toISOString().slice(0, 64);
+    return sanitizeForFirestore({
+      id: String(m.id).slice(0, 128),
+      name: String(m.name || m.id).slice(0, 128),
+      provider: String(m.provider || 'custom').slice(0, 64),
+      ownerKeyId: m.ownerKeyId ? String(m.ownerKeyId).slice(0, 128) : undefined,
+      ownerKeyHint: m.ownerKeyHint ? String(m.ownerKeyHint).slice(0, 64) : undefined,
+      contextWindow: typeof m.contextWindow === 'number' ? m.contextWindow : undefined,
+      pricingPrompt: typeof m.pricingPrompt === 'number' ? m.pricingPrompt : undefined,
+      pricingCompletion: typeof m.pricingCompletion === 'number' ? m.pricingCompletion : undefined,
+      activeKeysCount: typeof m.activeKeysCount === 'number' ? m.activeKeysCount : undefined,
+      isActive: true,
+      discoveredAt: String(m.discoveredAt || nowIso).slice(0, 64),
+      updatedAt: nowIso,
+      description: m.description ? String(m.description).slice(0, 512) : undefined
+    });
   };
 
   // Helper to obtain the authenticated user's Firebase ID token for backend Firestore REST operations
@@ -364,10 +414,32 @@ function GatewayApp() {
               ? ((await parseJsonSafe(adminKeysRes)).keys || [])
               : [];
 
-            const mergedMap = new Map<string, ProviderKey>();
-            for (const pk of backendPool) mergedMap.set(pk.id, pk);
-            for (const pk of firestorePool) mergedMap.set(pk.id, pk);
-            loadedProviderKeys = Array.from(mergedMap.values());
+            // Merge & deduplicate by raw API key so Firestore is never overwritten or duplicated
+            const mergedByKey = new Map<string, ProviderKey>();
+            for (const pk of backendPool) {
+              if (pk?.key) mergedByKey.set(pk.key, pk);
+            }
+            const firestoreKeysSet = new Set<string>();
+            for (const pk of firestorePool) {
+              if (pk?.key) {
+                firestoreKeysSet.add(pk.key);
+                mergedByKey.set(pk.key, pk);
+              }
+            }
+            loadedProviderKeys = Array.from(mergedByKey.values());
+
+            // Backfill any backend-only keys into Firestore permanently
+            const missingInFirestore = loadedProviderKeys.filter(pk => pk.key && !firestoreKeysSet.has(pk.key));
+            if (missingInFirestore.length > 0) {
+              for (let i = 0; i < missingInFirestore.length; i += 400) {
+                const batch = writeBatch(db);
+                for (const pk of missingInFirestore.slice(i, i + 400)) {
+                  const safeDoc = buildSafeProviderKeyDoc(pk);
+                  batch.set(doc(db, 'provider_keys', safeDoc.id), safeDoc);
+                }
+                await batch.commit().catch(() => {});
+              }
+            }
           } catch (err) {
             console.warn('Could not load provider_keys from Firestore:', err);
           }
@@ -376,21 +448,16 @@ function GatewayApp() {
 
       if (cancelled) return;
 
-      // If admin has 0 provider keys, ensure loadedModels is strictly empty and purge stale Firestore models
-      if (isAdmin && loadedProviderKeys.length === 0) {
-        loadedModels = [];
-        syncModelsToFirestore([]).catch(() => {});
-      }
-
       setModels(loadedModels);
       setApiKeys(loadedApiKeys);
       setProviderKeys(loadedProviderKeys);
 
+      // Merge into backend memory cleanly (never wipe with replaceProviderKeys=true on boot)
       await syncWithBackend(
         loadedApiKeys,
         isAdmin ? loadedProviderKeys : [],
         loadedModels,
-        isAdmin
+        false
       );
 
       // Re-read backend models in case backend rebuilt from synced provider keys
@@ -445,6 +512,38 @@ function GatewayApp() {
     );
     return () => unsubscribe();
   }, [currentUser]);
+
+  // Real-time Firestore listener for Admin Provider Pool so keys never disappear across reloads/tabs
+  useEffect(() => {
+    if (!currentUser || !isAdmin) return;
+    const unsubscribe = onSnapshot(
+      collection(db, 'provider_keys'),
+      (snapshot) => {
+        const docs = snapshot.docs.map((d) => d.data() as ProviderKey).filter((pk) => Boolean(pk?.key));
+        if (docs.length > 0) {
+          setProviderKeys((prev) => {
+            const byKey = new Map<string, ProviderKey>();
+            for (const p of prev) {
+              if (p?.key) byKey.set(p.key, p);
+            }
+            for (const d of docs) {
+              byKey.set(d.key, d);
+            }
+            return Array.from(byKey.values());
+          });
+          syncWithBackend([], docs, undefined, false).catch(() => {});
+        }
+      },
+      (error) => {
+        try {
+          handleFirestoreError(error, OperationType.GET, 'provider_keys');
+        } catch {
+          // Non-blocking fallback
+        }
+      }
+    );
+    return () => unsubscribe();
+  }, [currentUser, isAdmin, syncWithBackend]);
 
   // Dev Quick Login for testing inside sandboxes
   const handleDevQuickLogin = (email: string, displayName: string) => {
@@ -568,37 +667,49 @@ function GatewayApp() {
     syncWithBackend(updated, providerKeys);
   };
 
-  // Persist discovered models list to Firestore (Admin only)
+  // Persist discovered models list to Firestore atomically in batches (Admin only)
   const syncModelsToFirestore = useCallback(async (modelsList: GatewayModel[]) => {
     if (!currentUser || !isAdmin) return;
     try {
-      // Clear removed models from Firestore and write active ones
       const existingSnap = await getDocs(collection(db, 'models'));
       const activeDocIds = new Set(modelsList.map(m => toFirestoreDocId(m.id)));
+      const ops: Array<{ type: 'delete' | 'set'; id: string; data?: Record<string, any> }> = [];
+
       for (const d of existingSnap.docs) {
         if (!activeDocIds.has(d.id)) {
-          await deleteDoc(doc(db, 'models', d.id));
+          ops.push({ type: 'delete', id: d.id });
         }
       }
       for (const m of modelsList) {
-        const docId = toFirestoreDocId(m.id);
-        await setDoc(doc(db, 'models', docId), sanitizeForFirestore({
-          ...m,
-          id: String(m.id).slice(0, 128),
-          name: String(m.name || m.id).slice(0, 128),
-          provider: String(m.provider || 'custom').slice(0, 64),
-          ownerKeyId: m.ownerKeyId ? String(m.ownerKeyId).slice(0, 128) : undefined,
-          ownerKeyHint: m.ownerKeyHint ? String(m.ownerKeyHint).slice(0, 64) : undefined,
-          description: m.description ? String(m.description).slice(0, 512) : undefined,
-          updatedAt: new Date().toISOString()
-        }));
+        ops.push({
+          type: 'set',
+          id: toFirestoreDocId(m.id),
+          data: buildSafeModelDoc(m)
+        });
+      }
+
+      for (let i = 0; i < ops.length; i += 400) {
+        const batch = writeBatch(db);
+        for (const op of ops.slice(i, i + 400)) {
+          const ref = doc(db, 'models', op.id);
+          if (op.type === 'delete') {
+            batch.delete(ref);
+          } else if (op.data) {
+            batch.set(ref, op.data);
+          }
+        }
+        await batch.commit();
       }
     } catch (err) {
-      console.warn('Could not persist models to Firestore:', err);
+      try {
+        handleFirestoreError(err, OperationType.WRITE, 'models');
+      } catch {
+        // Logged structured FirestoreErrorInfo
+      }
     }
   }, [currentUser, isAdmin]);
 
-  // Admin Bulk Add Provider Keys & Auto-Discover Models (safe JSON parsing + Firestore sync)
+  // Admin Bulk Add Provider Keys & Auto-Discover Models (atomic batch Firestore persistence)
   const handleAddBulkProviderKeys = async (keysText: string, provider: string, customBaseUrl?: string) => {
     const fbToken = await getFirebaseIdToken();
     const res = await fetch('/api/admin/bulk-add-keys', {
@@ -660,27 +771,40 @@ function GatewayApp() {
       }));
 
       setProviderKeys(prev => {
-        const byId = new Map(prev.map(item => [item.id, item]));
-        for (const k of upsertedKeys) {
-          byId.set(k.id, k);
+        const byKey = new Map<string, ProviderKey>();
+        for (const item of prev) {
+          if (item?.key) byKey.set(item.key, item);
         }
-        return Array.from(byId.values());
+        for (const k of upsertedKeys) {
+          if (k?.key) byKey.set(k.key, k);
+        }
+        return Array.from(byKey.values());
       });
 
-      // Persist new/updated keys & discovered models to Firestore
+      // Persist all new/updated keys & discovered models atomically in Firestore batches
       if (currentUser && isAdmin) {
-        for (const pk of upsertedKeys) {
-          try {
-            await setDoc(doc(db, 'provider_keys', toFirestoreDocId(pk.id)), sanitizeForFirestore(pk));
-          } catch (err) {
-            try {
-              handleFirestoreError(err, OperationType.WRITE, `provider_keys/${pk.id}`);
-            } catch {
-              // Non-blocking fallback
+        try {
+          for (let i = 0; i < upsertedKeys.length; i += 400) {
+            const batch = writeBatch(db);
+            for (const pk of upsertedKeys.slice(i, i + 400)) {
+              const safeDoc = buildSafeProviderKeyDoc(pk);
+              batch.set(doc(db, 'provider_keys', safeDoc.id), safeDoc);
             }
+            await batch.commit();
+          }
+          await syncModelsToFirestore(nextModels);
+        } catch (err: any) {
+          showToast(
+            'Firestore Persistence Warning',
+            err?.message || 'Keys added in gateway memory, but Firestore write was rejected. Check Admin auth/rules.',
+            'error'
+          );
+          try {
+            handleFirestoreError(err, OperationType.WRITE, 'provider_keys');
+          } catch {
+            // Structured error logged
           }
         }
-        await syncModelsToFirestore(nextModels);
       }
     }
 
@@ -724,9 +848,14 @@ function GatewayApp() {
       const target = updated.find(k => k.id === keyId);
       if (target) {
         try {
-          await setDoc(doc(db, 'provider_keys', toFirestoreDocId(keyId)), sanitizeForFirestore(target));
+          const safeDoc = buildSafeProviderKeyDoc(target);
+          await setDoc(doc(db, 'provider_keys', safeDoc.id), safeDoc);
         } catch (err) {
-          console.warn('Could not update provider_key in Firestore:', err);
+          try {
+            handleFirestoreError(err, OperationType.WRITE, `provider_keys/${keyId}`);
+          } catch {
+            // Structured error logged
+          }
         }
       }
     }
@@ -792,12 +921,20 @@ function GatewayApp() {
     }
 
     if (currentUser && isAdmin) {
-      for (const pk of updated) {
-        if (pk.status === 'active') {
+      const activeKeysToSave = updated.filter(pk => pk.status === 'active');
+      for (let i = 0; i < activeKeysToSave.length; i += 400) {
+        try {
+          const batch = writeBatch(db);
+          for (const pk of activeKeysToSave.slice(i, i + 400)) {
+            const safeDoc = buildSafeProviderKeyDoc(pk);
+            batch.set(doc(db, 'provider_keys', safeDoc.id), safeDoc);
+          }
+          await batch.commit();
+        } catch (err) {
           try {
-            await setDoc(doc(db, 'provider_keys', toFirestoreDocId(pk.id)), sanitizeForFirestore(pk));
+            handleFirestoreError(err, OperationType.WRITE, 'provider_keys');
           } catch {
-            // ignore
+            // Structured error logged
           }
         }
       }

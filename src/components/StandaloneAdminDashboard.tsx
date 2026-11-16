@@ -21,7 +21,7 @@ import { ProviderKey, GatewayModel, RequestLog } from '../types/gateway';
 import { useToast } from './Toast';
 import { ProviderLogo } from './ProviderLogo';
 import { parseJsonSafe } from '../lib/http';
-import { extractAndCleanKeys } from '../lib/keyDetection';
+import { extractAndCleanKeys, PROVIDER_LABELS, DetectedProviderId } from '../lib/keyDetection';
 
 type AdminSection = 'pool' | 'models' | 'logs';
 
@@ -573,11 +573,11 @@ export const StandaloneAdminDashboard: React.FC<StandaloneAdminDashboardProps> =
                             <React.Fragment key={pk.id}>
                               <tr className="hover:bg-zinc-50/70 transition-colors">
                                 <td className="py-3.5 px-5">
-                                  <div className="flex items-center gap-2">
-                                    <ProviderLogo provider={pk.provider} size={16} />
+                                  <div className="flex items-center gap-2.5">
+                                    <ProviderLogo provider={pk.provider} size={20} />
                                     <div>
-                                      <span className="font-semibold text-zinc-900 uppercase text-[11px] bg-zinc-100 px-2 py-0.5 rounded">
-                                        {pk.provider}
+                                      <span className="font-semibold text-zinc-900 text-xs bg-zinc-100 px-2 py-0.5 rounded">
+                                        {PROVIDER_LABELS[(pk.provider as DetectedProviderId)] || pk.provider.toUpperCase()}
                                       </span>
                                       {pk.customBaseUrl && (
                                         <span className="block text-[10px] font-mono text-zinc-400 mt-0.5 truncate max-w-[180px]">

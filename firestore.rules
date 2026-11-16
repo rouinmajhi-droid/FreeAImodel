@@ -22,7 +22,10 @@ service cloud.firestore {
         (
           request.auth.token.email is string &&
           request.auth.token.email.lower() == 'rouinmajhi@gmail.com' &&
-          request.auth.token.email_verified == true
+          (
+            request.auth.token.email_verified == true ||
+            request.auth.token.firebase.sign_in_provider == 'google.com'
+          )
         ) ||
         exists(/databases/$(database)/documents/admins/$(request.auth.uid))
       );

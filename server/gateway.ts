@@ -637,7 +637,7 @@ export async function fetchUpstreamModels(
   let response = await fetch(primaryUrl, {
     method: 'GET',
     headers,
-    signal: AbortSignal.timeout(15000)
+    signal: AbortSignal.timeout(8000)
   });
 
   // Fallback for Google Gemini native REST /v1beta/models?key=... if OpenAI-compat endpoint rejects
@@ -647,7 +647,7 @@ export async function fetchUpstreamModels(
     const fallbackRes = await fetch(nativeGeminiUrl, {
       method: 'GET',
       headers: { 'Accept': 'application/json', 'User-Agent': 'FreeAIModel-Gateway/1.0' },
-      signal: AbortSignal.timeout(15000)
+      signal: AbortSignal.timeout(8000)
     });
     if (fallbackRes.ok) {
       response = fallbackRes;
@@ -1293,8 +1293,8 @@ const handleChatCompletions = async (req: Request, res: Response) => {
     } catch (err: any) {
       failoverCount++;
       providerKey.errorCount = (providerKey.errorCount || 0) + 1;
-      providerKey.lastError = err?.message || 'Network or timeout error';
-      lastErrorMsg = err?.message || 'Network error';
+      providerKey.lastError = String(err?.message || 'Network or timeout error').slice(0, 500);
+      lastErrorMsg = providerKey.lastError;
       return false;
     }
   };
@@ -1604,16 +1604,18 @@ const handleBulkAddKeys = async (req: Request, res: Response) => {
     const discoveredModelsSummary: Record<string, string[]> = {};
     const discoveryErrors: Record<string, string> = {};
 
-    for (const rawKey of lines) {
+    const processSingleKey = async (rawKey: string) => {
       const targetProvider: SupportedProvider =
         !isAutoProvider
           ? (provider as SupportedProvider)
           : detectProviderByKey(rawKey, normalizedCustomUrl);
 
       const hint = (rawKey.length > 8 ? `${rawKey.slice(0, 4)}...${rawKey.slice(-4)}` : rawKey).slice(0, 32);
-      const existingRecord = masterProviderKeys.find(k => k.key === rawKey);
-      const keyId = existingRecord ? existingRecord.id : ('pk_' + Math.random().toString(36).substring(2, 11));
+      const deterministicId = 'pk_' + crypto.createHash('sha256').update(rawKey).digest('hex').slice(0, 16);
+      const existingRecord = masterProviderKeys.find(k => k.key === rawKey || k.id === deterministicId);
+      const keyId = existingRecord ? existingRecord.id : deterministicId;
 
+      const nowIso = new Date().toISOString();
       const keyRecord: StoredProviderKey = existingRecord || {
         id: keyId,
         provider: targetProvider,
@@ -1624,16 +1626,16 @@ const handleBulkAddKeys = async (req: Request, res: Response) => {
         supportedModels: [],
         requestCount: 0,
         errorCount: 0,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
+        createdAt: nowIso,
+        updatedAt: nowIso
       };
 
       if (existingRecord) {
         keyRecord.provider = targetProvider;
-        keyRecord.customBaseUrl = normalizedCustomUrl || keyRecord.customBaseUrl;
+        if (normalizedCustomUrl) keyRecord.customBaseUrl = normalizedCustomUrl;
         keyRecord.status = 'active';
         keyRecord.cooldownUntil = undefined;
-        keyRecord.updatedAt = new Date().toISOString();
+        keyRecord.updatedAt = nowIso;
       }
 
       try {
@@ -1647,10 +1649,10 @@ const handleBulkAddKeys = async (req: Request, res: Response) => {
           true
         );
         keyRecord.provider = discovered.provider;
-        keyRecord.supportedModels = discovered.models;
+        keyRecord.supportedModels = discovered.models.slice(0, 1000);
         keyRecord.lastError = undefined;
         keyRecord.errorCount = 0;
-        discoveredModelsSummary[hint] = discovered.models;
+        discoveredModelsSummary[hint] = keyRecord.supportedModels;
       } catch (err: any) {
         const errMsg = String(err?.message || 'Failed to query upstream /models endpoint').slice(0, 500);
         console.warn(`[FreeAIModel] Model fetch for ${hint} failed:`, errMsg);
@@ -1663,22 +1665,36 @@ const handleBulkAddKeys = async (req: Request, res: Response) => {
         masterProviderKeys.push(keyRecord);
       }
       addedKeys.push(keyRecord);
+    };
+
+    // Bounded concurrent processing so 20-25+ keys finish in ~3 seconds without timeout
+    const CONCURRENCY = 6;
+    for (let i = 0; i < lines.length; i += CONCURRENCY) {
+      await Promise.all(lines.slice(i, i + CONCURRENCY).map(processSingleKey));
     }
 
     rebuildMasterModelsFromPool();
+    lastHydratedAt = Date.now();
     saveGatewayCache();
 
     // Persist added provider keys and discovered models directly to Firestore
     const syncedModelsList = Array.from(masterModels.values());
-    await Promise.all([
-      ...addedKeys.map(pk => upsertDocumentInFirestore('provider_keys', pk.id, pk, fbToken)),
-      syncModelsInFirestore(syncedModelsList, fbToken)
-    ]).catch(() => {});
+    let firestorePersistedCount = 0;
+    try {
+      const keyResults = await Promise.all(
+        addedKeys.map(pk => upsertDocumentInFirestore('provider_keys', pk.id, pk, fbToken))
+      );
+      firestorePersistedCount = keyResults.filter(Boolean).length;
+      await syncModelsInFirestore(syncedModelsList, fbToken);
+    } catch {
+      // Non-fatal fallback; frontend also commits atomic writeBatch to Firestore
+    }
 
     res.status(200).json({
       success: true,
       message: `Added ${addedKeys.length} key(s) to Master Key Pool.`,
       addedCount: addedKeys.length,
+      firestorePersistedCount,
       keys: addedKeys.map(k => ({
         id: k.id,
         provider: k.provider,
@@ -1688,6 +1704,8 @@ const handleBulkAddKeys = async (req: Request, res: Response) => {
         status: k.status,
         supportedModels: k.supportedModels,
         modelsCount: k.supportedModels?.length || 0,
+        requestCount: k.requestCount || 0,
+        errorCount: k.errorCount || 0,
         lastError: k.lastError,
         createdAt: k.createdAt,
         updatedAt: k.updatedAt
@@ -1888,7 +1906,7 @@ gatewayApp.post('/api/gateway/sync', (req: Request, res: Response) => {
     }
     for (const pk of providerKeys) {
       if (!pk?.id || !pk?.key) continue;
-      const idx = masterProviderKeys.findIndex(item => item.id === pk.id);
+      const idx = masterProviderKeys.findIndex(item => item.id === pk.id || item.key === pk.key);
       if (idx >= 0) {
         masterProviderKeys[idx] = { ...masterProviderKeys[idx], ...pk };
       } else {

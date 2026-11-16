@@ -59,6 +59,7 @@ export interface ProviderKey {
   errorCount: number;
   lastError?: string;
   cooldownUntil?: number; // timestamp in ms
+  lastUsedAt?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -73,7 +74,9 @@ export interface GatewayModel {
   pricingPrompt?: number; // per 1k tokens in USD
   pricingCompletion?: number; // per 1k tokens in USD
   activeKeysCount?: number;
+  isActive?: boolean;
   discoveredAt: string;
+  updatedAt?: string;
   description?: string;
 }
 

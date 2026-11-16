@@ -146,45 +146,54 @@ async function getServiceAccountToken(): Promise<string | null> {
     }
   }
 
-  // Fallback: check GCP metadata server when running in Cloud Run / GCE (fast timeout)
+  return null;
+}
+
+async function getMatchingMetadataToken(): Promise<string | null> {
+  const now = Date.now();
+  const cfg = loadFirebaseConfig();
+  if (!cfg) return null;
   if (!metadataAvailable && now - metadataCheckedAt < 300_000) {
     return null;
   }
   metadataCheckedAt = now;
   try {
-    const metaRes = await fetch(
-      'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token',
-      {
+    const [projRes, metaRes] = await Promise.all([
+      fetch('http://metadata.google.internal/computeMetadata/v1/project/project-id', {
         headers: { 'Metadata-Flavor': 'Google' },
-        signal: AbortSignal.timeout(600)
+        signal: AbortSignal.timeout(500)
+      }),
+      fetch('http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token', {
+        headers: { 'Metadata-Flavor': 'Google' },
+        signal: AbortSignal.timeout(500)
+      })
+    ]);
+    if (projRes.ok && metaRes.ok) {
+      const metadataProjectId = (await projRes.text()).trim();
+      if (metadataProjectId !== cfg.projectId) {
+        metadataAvailable = false;
+        return null;
       }
-    );
-    if (metaRes.ok) {
       const json: any = await metaRes.json();
       if (json?.access_token) {
         metadataAvailable = true;
-        cachedAccessToken = {
-          token: json.access_token,
-          expiresAt: now + (Number(json.expires_in) || 3500) * 1000
-        };
-        return cachedAccessToken.token;
+        return json.access_token;
       }
     }
     metadataAvailable = false;
   } catch {
     metadataAvailable = false;
   }
-
   return null;
 }
 
 async function resolveAuthToken(explicitIdToken?: string): Promise<string | null> {
-  const serverToken = await getServiceAccountToken();
-  if (serverToken) return serverToken;
+  const saToken = await getServiceAccountToken();
+  if (saToken) return saToken;
   if (explicitIdToken && explicitIdToken.trim().length > 20) {
     return explicitIdToken.trim();
   }
-  return null;
+  return getMatchingMetadataToken();
 }
 
 export function hasServerAdminCredentials(): boolean {
@@ -269,7 +278,7 @@ function fromFirestoreDocument<T = Record<string, any>>(docObj: any): T | null {
 function toFirestoreFields(data: Record<string, any>): Record<string, any> {
   const fields: Record<string, any> = {};
   for (const [k, v] of Object.entries(data)) {
-    if (v !== undefined) {
+    if (v !== undefined && v !== null) {
       fields[k] = toFirestoreValue(v);
     }
   }
@@ -324,10 +333,15 @@ export async function upsertDocumentInFirestore(
       body: JSON.stringify({
         fields: toFirestoreFields(data)
       }),
-      signal: AbortSignal.timeout(6000)
+      signal: AbortSignal.timeout(8000)
     });
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => '');
+      console.warn(`[FirestoreStore] Failed PATCH ${collectionName}/${docId} (${res.status}):`, errBody.slice(0, 200));
+    }
     return res.ok;
-  } catch {
+  } catch (err) {
+    console.warn(`[FirestoreStore] Exception PATCH ${collectionName}/${docId}:`, err);
     return false;
   }
 }
