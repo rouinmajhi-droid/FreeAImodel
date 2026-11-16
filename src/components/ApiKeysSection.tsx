@@ -88,8 +88,8 @@ export const ApiKeysSection: React.FC<ApiKeysSectionProps> = ({
   // Canonical FreeAIModel Gateway URL default
   const liveOrigin = typeof window !== 'undefined' && window.location.origin
     ? window.location.origin
-    : 'https://freeaimodel.vercel.app';
-  const customDomain = 'https://freeaimodel.vercel.app';
+    : 'https://freeaimodel.cc.cd';
+  const customDomain = 'https://freeaimodel.cc.cd';
   const baseUrl = useLiveUrl ? liveOrigin : customDomain;
 
   // Seamlessly populate the user's active API key and live discovered model
@@ -227,7 +227,7 @@ console.log(response.choices[0].message.content);`
                   const maskedValue = `${k.key.slice(0, 11)}••••••••••••••••${k.key.slice(-4)}`;
 
                   const dynamicModel = models[0]?.id || 'YOUR_ACTIVE_MODEL_ID';
-                  const curlCodeForThisKey = `curl -X POST https://freeaimodel.vercel.app/v1/chat/completions \\
+                  const curlCodeForThisKey = `curl -X POST ${baseUrl}/v1/chat/completions \\
   -H "Authorization: Bearer ${k.key}" \\
   -H "Content-Type: application/json" \\
   -d '{"messages": [{"role": "user", "content": "Hello!"}], "model": "${dynamicModel}"}'`;
@@ -313,13 +313,13 @@ console.log(response.choices[0].message.content);`
                               <div className="flex items-center gap-2">
                                 <span className="text-zinc-400 font-sans font-medium">Base URL:</span>
                                 <span className="text-cyan-300 font-bold select-all bg-zinc-800/80 px-2 py-0.5 rounded border border-zinc-700/60">
-                                  https://freeaimodel.vercel.app/v1
+                                  {baseUrl}/v1
                                 </span>
                               </div>
                               <button
                                 onClick={() => {
-                                  navigator.clipboard.writeText('https://freeaimodel.vercel.app/v1');
-                                  showToast('Copied', 'Base URL (https://freeaimodel.vercel.app/v1) copied to clipboard.', 'success');
+                                  navigator.clipboard.writeText(`${baseUrl}/v1`);
+                                  showToast('Copied', `Base URL (${baseUrl}/v1) copied to clipboard.`, 'success');
                                 }}
                                 className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-sans font-medium transition-colors cursor-pointer w-fit"
                               >
@@ -331,7 +331,7 @@ console.log(response.choices[0].message.content);`
                             {/* cURL Command Block */}
                             <div className="flex items-start justify-between gap-3">
                               <pre className="text-xs text-zinc-200 overflow-x-auto whitespace-pre-wrap leading-relaxed select-all">
-                                <span className="text-emerald-400 font-semibold">curl</span> -X <span className="text-cyan-400 font-bold">POST</span> https://freeaimodel.vercel.app/v1/chat/completions \<br />
+                                <span className="text-emerald-400 font-semibold">curl</span> -X <span className="text-cyan-400 font-bold">POST</span> {baseUrl}/v1/chat/completions \<br />
                                 {'  '}-H <span className="text-amber-300">"Authorization: Bearer <span className="text-cyan-300 font-bold">{k.key}</span>"</span> \<br />
                                 {'  '}-H <span className="text-amber-300">"Content-Type: application/json"</span> \<br />
                                 {'  '}-d <span className="text-emerald-300">'{`{"messages": [{"role": "user", "content": "Hello!"}], "model": "${dynamicModel}"}`}'</span>
@@ -420,7 +420,7 @@ console.log(response.choices[0].message.content);`
               title="Toggle Custom Domain vs Live Origin"
             >
               <Globe className="w-3 h-3 text-cyan-400" />
-              <span>{useLiveUrl ? 'Local Origin' : 'freeaimodel.vercel.app'}</span>
+              <span>{useLiveUrl ? 'Local Origin' : 'freeaimodel.cc.cd'}</span>
             </button>
 
             {/* Language Switcher Tabs */}

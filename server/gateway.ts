@@ -2,14 +2,15 @@ import express, { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 import dotenv from 'dotenv';
 import {
-  listCollectionFromFirestore,
-  upsertDocumentInFirestore,
-  deleteDocumentFromFirestore,
-  findApiKeyBySecretInFirestore,
-  syncModelsInFirestore,
+  listCollectionFromRtdb,
+  upsertItemInRtdb,
+  patchCollectionInRtdb,
+  deleteItemFromRtdb,
+  findApiKeyBySecretInRtdb,
+  syncModelsInRtdb,
   hasServerAdminCredentials,
-  getFirestoreBridgeStatus
-} from './firestoreStore.js';
+  getRtdbBridgeStatus
+} from './rtdbStore.js';
 
 dotenv.config();
 
@@ -143,7 +144,7 @@ export function ensureDailyCreditsReset(account: StoredUserAccount): boolean {
 }
 
 // ==========================================
-// In-memory Master Stores (Authoritative persistence via Firebase Firestore)
+// In-memory Runtime Cache (100% backed by Firebase Realtime Database)
 // ==========================================
 export const masterApiKeys = new Map<string, StoredApiKey>();
 export const masterProviderKeys: StoredProviderKey[] = [];
@@ -160,13 +161,11 @@ function extractFirebaseToken(req: Request): string | undefined {
 }
 
 /**
- * Hydrate in-memory stores from Firestore on cold starts or when cache is empty.
+ * Hydrate in-memory stores directly from Firebase Realtime Database on cold starts or TTL expiry.
  */
 export async function ensureGatewayHydrated(explicitIdToken?: string, force = false): Promise<void> {
   const now = Date.now();
-  const hasTokenOrCreds = Boolean(explicitIdToken || hasServerAdminCredentials());
-  if (!hasTokenOrCreds) return;
-  if (!force && masterProviderKeys.length > 0 && now - lastHydratedAt < 30_000) return;
+  if (!force && lastHydratedAt > 0 && now - lastHydratedAt < 15_000) return;
 
   if (hydrationInFlight) {
     await hydrationInFlight;
@@ -175,37 +174,48 @@ export async function ensureGatewayHydrated(explicitIdToken?: string, force = fa
 
   hydrationInFlight = (async () => {
     try {
-      const [dbProviderKeys, dbModels, dbApiKeys, dbLogs] = await Promise.all([
-        listCollectionFromFirestore<StoredProviderKey>('provider_keys', explicitIdToken, 300),
-        listCollectionFromFirestore<StoredModel>('models', explicitIdToken, 500),
-        listCollectionFromFirestore<StoredApiKey>('api_keys', explicitIdToken, 500),
-        listCollectionFromFirestore<StoredRequestLog>('request_logs', explicitIdToken, 100)
+      const [dbProviderKeys, dbModels, dbApiKeys, dbLogs, dbUsers] = await Promise.all([
+        listCollectionFromRtdb<StoredProviderKey>('provider_keys', explicitIdToken),
+        listCollectionFromRtdb<StoredModel>('models', explicitIdToken),
+        listCollectionFromRtdb<StoredApiKey>('api_keys', explicitIdToken),
+        listCollectionFromRtdb<StoredRequestLog>('request_logs', explicitIdToken),
+        listCollectionFromRtdb<StoredUserAccount>('user_profiles', explicitIdToken)
       ]);
 
-      if (Array.isArray(dbProviderKeys) && dbProviderKeys.length > 0) {
+      if (Array.isArray(dbProviderKeys)) {
         const byId = new Map<string, StoredProviderKey>();
         for (const existing of masterProviderKeys) byId.set(existing.id, existing);
+        masterProviderKeys.length = 0;
         for (const pk of dbProviderKeys) {
           if (pk?.id && pk?.key) {
             const local = byId.get(pk.id);
-            byId.set(pk.id, local ? { ...pk, ...local, supportedModels: pk.supportedModels?.length ? pk.supportedModels : local.supportedModels } : pk);
+            masterProviderKeys.push(
+              local
+                ? {
+                    ...pk,
+                    supportedModels: pk.supportedModels?.length ? pk.supportedModels : local.supportedModels
+                  }
+                : pk
+            );
           }
         }
-        masterProviderKeys.length = 0;
-        masterProviderKeys.push(...Array.from(byId.values()));
       }
 
-      if (Array.isArray(dbModels) && dbModels.length > 0) {
+      if (Array.isArray(dbModels)) {
+        masterModels.clear();
         for (const m of dbModels) {
           if (m?.id && m?.ownerKeyId) {
             masterModels.set(m.id, m);
           }
         }
-      } else if (masterProviderKeys.length > 0 && masterModels.size === 0) {
+      }
+
+      if (masterProviderKeys.length > 0 && masterModels.size === 0) {
         rebuildMasterModelsFromPool();
       }
 
       if (Array.isArray(dbApiKeys)) {
+        masterApiKeys.clear();
         for (const ak of dbApiKeys) {
           if (ak?.key) {
             masterApiKeys.set(ak.key, ak);
@@ -213,14 +223,23 @@ export async function ensureGatewayHydrated(explicitIdToken?: string, force = fa
         }
       }
 
-      if (Array.isArray(dbLogs) && dbLogs.length > 0 && masterLogs.length === 0) {
+      if (Array.isArray(dbLogs) && dbLogs.length > 0) {
         const sorted = [...dbLogs].sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));
+        masterLogs.length = 0;
         masterLogs.push(...sorted.slice(0, 200));
       }
 
+      if (Array.isArray(dbUsers)) {
+        for (const u of dbUsers) {
+          if (u?.uid) {
+            masterUsers.set(u.uid, u);
+          }
+        }
+      }
+
       lastHydratedAt = Date.now();
-        } catch (err) {
-      console.warn('[FreeAIModel] Firestore hydration skipped:', err);
+    } catch (err) {
+      console.warn('[FreeAIModel] RTDB hydration error:', err);
     } finally {
       hydrationInFlight = null;
     }
@@ -653,14 +672,14 @@ async function resolveRegisteredGatewayKey(apiKeyToken: string): Promise<StoredA
   const localMatch = masterApiKeys.get(apiKeyToken);
   if (localMatch) return localMatch;
 
-  await ensureGatewayHydrated();
+  await ensureGatewayHydrated(undefined, true);
   const afterHydration = masterApiKeys.get(apiKeyToken);
   if (afterHydration) return afterHydration;
 
-  const dbMatch = await findApiKeyBySecretInFirestore<StoredApiKey>(apiKeyToken);
+  const dbMatch = await findApiKeyBySecretInRtdb<StoredApiKey>(apiKeyToken);
   if (dbMatch && dbMatch.key) {
     masterApiKeys.set(dbMatch.key, dbMatch);
-      return dbMatch;
+    return dbMatch;
   }
 
   return null;
@@ -804,11 +823,47 @@ function buildOpenAiModelsList() {
   };
 }
 
+async function ensureLiveModelsDiscoveredFromPool(explicitIdToken?: string): Promise<void> {
+  if (masterModels.size > 0) return;
+  const activePool = masterProviderKeys.filter(k => k.status !== 'disabled');
+  if (activePool.length === 0) return;
+
+  rebuildMasterModelsFromPool();
+  if (masterModels.size > 0) return;
+
+  // Pool keys exist in RTDB without cached supportedModels: fetch live upstream models now
+  const CONCURRENCY = 6;
+  const updatedKeys: Record<string, StoredProviderKey> = {};
+  for (let i = 0; i < activePool.length; i += CONCURRENCY) {
+    await Promise.all(
+      activePool.slice(i, i + CONCURRENCY).map(async (pKey) => {
+        try {
+          const discovered = await fetchUpstreamModels(pKey.provider, pKey.key, pKey.customBaseUrl, pKey.id, pKey.keyHint);
+          pKey.supportedModels = discovered;
+          pKey.updatedAt = new Date().toISOString();
+          updatedKeys[pKey.id] = pKey;
+        } catch {
+          // Leave existing key record untouched on transient network error
+        }
+      })
+    );
+  }
+  rebuildMasterModelsFromPool();
+  if (Object.keys(updatedKeys).length > 0) {
+    await Promise.all([
+      patchCollectionInRtdb('provider_keys', updatedKeys, explicitIdToken),
+      syncModelsInRtdb(Array.from(masterModels.values()), explicitIdToken)
+    ]).catch(() => {});
+  }
+}
+
 // ==========================================
 // Public / Frontend Dashboard Model Catalog Endpoint (100% live models only)
 // ==========================================
 gatewayApp.get('/api/models', async (req: Request, res: Response) => {
-  await ensureGatewayHydrated(extractFirebaseToken(req));
+  const fbToken = extractFirebaseToken(req);
+  await ensureGatewayHydrated(fbToken, masterProviderKeys.length === 0);
+  await ensureLiveModelsDiscoveredFromPool(fbToken);
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.json(buildOpenAiModelsList());
 });
@@ -817,7 +872,9 @@ gatewayApp.get('/api/models', async (req: Request, res: Response) => {
 // Route: GET /v1/models & GET /models (Strict Key Verification if provided + Public Discovery)
 // ==========================================
 gatewayApp.get('/v1/models', optionalFlexibleGatewayAuth, async (req: Request, res: Response) => {
-  await ensureGatewayHydrated(extractFirebaseToken(req));
+  const fbToken = extractFirebaseToken(req);
+  await ensureGatewayHydrated(fbToken, masterProviderKeys.length === 0);
+  await ensureLiveModelsDiscoveredFromPool(fbToken);
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.json(buildOpenAiModelsList());
 });
@@ -832,7 +889,9 @@ gatewayApp.get('/models', optionalFlexibleGatewayAuth, async (req: Request, res:
     return;
   }
 
-  await ensureGatewayHydrated(extractFirebaseToken(req));
+  const fbToken = extractFirebaseToken(req);
+  await ensureGatewayHydrated(fbToken, masterProviderKeys.length === 0);
+  await ensureLiveModelsDiscoveredFromPool(fbToken);
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.json(buildOpenAiModelsList());
 });
@@ -914,7 +973,7 @@ const handleChatCompletions = async (req: Request, res: Response) => {
     return;
   }
 
-  await ensureGatewayHydrated();
+  await ensureGatewayHydrated(undefined, masterProviderKeys.length === 0);
 
   const now = Date.now();
   const dirtyProviderKeys = new Set<StoredProviderKey>();
@@ -1258,11 +1317,11 @@ const handleChatCompletions = async (req: Request, res: Response) => {
     }
   }
 
-  // Persist rotated/rate-limited/exhausted provider key telemetry to Firestore + /tmp cache
+  // Persist rotated/rate-limited/exhausted provider key telemetry to Firebase RTDB
   if (dirtyProviderKeys.size > 0) {
-      Promise.all(
-      Array.from(dirtyProviderKeys).map(pk => upsertDocumentInFirestore('provider_keys', pk.id, pk))
-    ).catch(() => {});
+    const dirtyPatch: Record<string, StoredProviderKey> = {};
+    for (const pk of dirtyProviderKeys) dirtyPatch[pk.id] = pk;
+    patchCollectionInRtdb('provider_keys', dirtyPatch).catch(() => {});
   }
 
   if (!success) {
@@ -1320,10 +1379,10 @@ const handleChatCompletions = async (req: Request, res: Response) => {
   }
 
 
-  // Background Firestore persistence for usage, key stats, and telemetry log
+  // Background Firebase RTDB persistence for usage, key stats, and telemetry log
   Promise.all([
-    upsertDocumentInFirestore('api_keys', apiKeyRecord.id, apiKeyRecord),
-    upsertDocumentInFirestore('request_logs', logEntry.id, logEntry)
+    upsertItemInRtdb('api_keys', apiKeyRecord.id, apiKeyRecord),
+    upsertItemInRtdb('request_logs', logEntry.id, logEntry)
   ]).catch(() => {});
 };
 
@@ -1413,10 +1472,10 @@ gatewayApp.get('/api/user/credits', (req: Request, res: Response) => {
 });
 
 // ==========================================
-// User Gateway API Keys CRUD (/api/keys) — Persisted to Memory, Cache, & Firestore
+// User Gateway API Keys CRUD (/api/keys) — Persisted to Firebase RTDB
 // ==========================================
 gatewayApp.get('/api/keys', async (req: Request, res: Response) => {
-  await ensureGatewayHydrated(extractFirebaseToken(req));
+  await ensureGatewayHydrated(extractFirebaseToken(req), masterApiKeys.size === 0);
   const userId = typeof req.query.userId === 'string' ? req.query.userId.trim() : '';
   const allKeys = Array.from(masterApiKeys.values());
   const keys = userId ? allKeys.filter(k => k.userId === userId) : allKeys;
@@ -1450,8 +1509,8 @@ gatewayApp.post('/api/keys', async (req: Request, res: Response) => {
     };
 
     masterApiKeys.set(newKey.key, newKey);
-  
-    const persistedToDb = await upsertDocumentInFirestore('api_keys', newKey.id, newKey, fbToken);
+
+    const persistedToDb = await upsertItemInRtdb('api_keys', newKey.id, newKey, fbToken);
 
     res.status(200).json({
       success: true,
@@ -1475,7 +1534,7 @@ gatewayApp.delete('/api/keys/:id', async (req: Request, res: Response) => {
     }
   }
 
-  await deleteDocumentFromFirestore('api_keys', id, fbToken);
+  await deleteItemFromRtdb('api_keys', id, fbToken);
 
   res.json({ success: true, removed });
 });
@@ -1596,24 +1655,28 @@ const handleBulkAddKeys = async (req: Request, res: Response) => {
     rebuildMasterModelsFromPool();
     lastHydratedAt = Date.now();
   
-    // Persist added provider keys and discovered models directly to Firestore
+    // Persist added provider keys and discovered models directly to Firebase Realtime Database
     const syncedModelsList = Array.from(masterModels.values());
-    let firestorePersistedCount = 0;
+    let rtdbPersistedCount = 0;
     try {
-      const keyResults = await Promise.all(
-        addedKeys.map(pk => upsertDocumentInFirestore('provider_keys', pk.id, pk, fbToken))
-      );
-      firestorePersistedCount = keyResults.filter(Boolean).length;
-      await syncModelsInFirestore(syncedModelsList, fbToken);
+      const keysPatch: Record<string, StoredProviderKey> = {};
+      for (const pk of addedKeys) {
+        keysPatch[pk.id] = pk;
+      }
+      const [keysOk] = await Promise.all([
+        patchCollectionInRtdb('provider_keys', keysPatch, fbToken),
+        syncModelsInRtdb(syncedModelsList, fbToken)
+      ]);
+      rtdbPersistedCount = keysOk ? addedKeys.length : 0;
     } catch {
-      // Non-fatal fallback; frontend also commits atomic writeBatch to Firestore
+      // Non-fatal fallback; frontend also persists to RTDB
     }
 
     res.status(200).json({
       success: true,
       message: `Added ${addedKeys.length} key(s) to Master Key Pool.`,
       addedCount: addedKeys.length,
-      firestorePersistedCount,
+      rtdbPersistedCount,
       keys: addedKeys.map(k => ({
         id: k.id,
         provider: k.provider,
@@ -1643,7 +1706,7 @@ gatewayApp.post('/api/admin/bulk-add-keys', checkOptionalAdminHeader, handleBulk
 gatewayApp.post('/api/models/add-keys', checkOptionalAdminHeader, handleBulkAddKeys);
 
 gatewayApp.get('/api/admin/keys', checkOptionalAdminHeader, async (req: Request, res: Response) => {
-  await ensureGatewayHydrated(extractFirebaseToken(req));
+  await ensureGatewayHydrated(extractFirebaseToken(req), masterProviderKeys.length === 0);
   res.json({ keys: masterProviderKeys });
 });
 
@@ -1651,26 +1714,28 @@ gatewayApp.post('/api/admin/keys/reset-cooldowns', checkOptionalAdminHeader, asy
   const fbToken = extractFirebaseToken(req);
   await ensureGatewayHydrated(fbToken);
 
-  const restored: StoredProviderKey[] = [];
+  const restoredPatch: Record<string, StoredProviderKey> = {};
+  let restoredCount = 0;
   for (const pk of masterProviderKeys) {
     if (pk.status === 'rate_limited' || pk.status === 'exhausted') {
       pk.status = 'active';
       pk.cooldownUntil = undefined;
       pk.lastError = undefined;
       pk.updatedAt = new Date().toISOString();
-      restored.push(pk);
+      restoredPatch[pk.id] = pk;
+      restoredCount++;
     }
   }
 
   rebuildMasterModelsFromPool();
 
-  await Promise.all(
-    restored.map(pk => upsertDocumentInFirestore('provider_keys', pk.id, pk, fbToken))
-  ).catch(() => {});
+  if (restoredCount > 0) {
+    await patchCollectionInRtdb('provider_keys', restoredPatch, fbToken).catch(() => {});
+  }
 
   res.json({
     success: true,
-    restoredCount: restored.length,
+    restoredCount,
     keys: masterProviderKeys,
     models: Array.from(masterModels.values())
   });
@@ -1694,8 +1759,8 @@ gatewayApp.patch('/api/admin/keys/:id/status', checkOptionalAdminHeader, async (
 
   const modelsList = Array.from(masterModels.values());
   await Promise.all([
-    upsertDocumentInFirestore('provider_keys', target.id, target, fbToken),
-    syncModelsInFirestore(modelsList, fbToken)
+    upsertItemInRtdb('provider_keys', target.id, target, fbToken),
+    syncModelsInRtdb(modelsList, fbToken)
   ]).catch(() => {});
 
   res.json({ success: true, key: target, models: modelsList });
@@ -1714,8 +1779,8 @@ gatewayApp.delete('/api/admin/keys/:id', checkOptionalAdminHeader, async (req: R
 
   const modelsList = Array.from(masterModels.values());
   await Promise.all([
-    deleteDocumentFromFirestore('provider_keys', id, fbToken),
-    syncModelsInFirestore(modelsList, fbToken)
+    deleteItemFromRtdb('provider_keys', id, fbToken),
+    syncModelsInRtdb(modelsList, fbToken)
   ]).catch(() => {});
 
   res.json({ success: true, models: modelsList, totalKeysInPool: masterProviderKeys.length });
@@ -1723,33 +1788,40 @@ gatewayApp.delete('/api/admin/keys/:id', checkOptionalAdminHeader, async (req: R
 
 gatewayApp.post('/api/models/refresh', async (req: Request, res: Response) => {
   const fbToken = extractFirebaseToken(req);
-  await ensureGatewayHydrated(fbToken);
+  await ensureGatewayHydrated(fbToken, true);
 
   const results: Record<string, { status: string; count: number; error?: string }> = {};
   let totalDiscovered = 0;
+  const updatedPatch: Record<string, StoredProviderKey> = {};
 
-  for (const pKey of masterProviderKeys) {
-    if (pKey.status === 'disabled') continue;
-    try {
-      const models = await fetchUpstreamModels(pKey.provider, pKey.key, pKey.customBaseUrl, pKey.id, pKey.keyHint);
-      pKey.supportedModels = models;
-      pKey.errorCount = 0;
-      pKey.lastError = undefined;
-      pKey.status = 'active';
-      pKey.updatedAt = new Date().toISOString();
-      results[pKey.keyHint] = { status: 'success', count: models.length };
-      totalDiscovered += models.length;
-    } catch (err: any) {
-      results[pKey.keyHint] = { status: 'failed', count: 0, error: err?.message || 'Upstream fetch failed' };
-    }
+  const CONCURRENCY = 6;
+  const activePool = masterProviderKeys.filter(pk => pk.status !== 'disabled');
+  for (let i = 0; i < activePool.length; i += CONCURRENCY) {
+    await Promise.all(
+      activePool.slice(i, i + CONCURRENCY).map(async (pKey) => {
+        try {
+          const models = await fetchUpstreamModels(pKey.provider, pKey.key, pKey.customBaseUrl, pKey.id, pKey.keyHint);
+          pKey.supportedModels = models;
+          pKey.errorCount = 0;
+          pKey.lastError = undefined;
+          pKey.status = 'active';
+          pKey.updatedAt = new Date().toISOString();
+          updatedPatch[pKey.id] = pKey;
+          results[pKey.keyHint] = { status: 'success', count: models.length };
+          totalDiscovered += models.length;
+        } catch (err: any) {
+          results[pKey.keyHint] = { status: 'failed', count: 0, error: err?.message || 'Upstream fetch failed' };
+        }
+      })
+    );
   }
 
   rebuildMasterModelsFromPool();
 
   const modelsList = Array.from(masterModels.values());
   await Promise.all([
-    ...masterProviderKeys.map(pk => upsertDocumentInFirestore('provider_keys', pk.id, pk, fbToken)),
-    syncModelsInFirestore(modelsList, fbToken)
+    patchCollectionInRtdb('provider_keys', updatedPatch, fbToken),
+    syncModelsInRtdb(modelsList, fbToken)
   ]).catch(() => {});
 
   res.json({
@@ -1869,16 +1941,20 @@ gatewayApp.get('/api/stats', async (req: Request, res: Response) => {
   const totalCost = masterLogs.reduce((acc, log) => acc + (log.costUsd || 0), 0);
   const activeKeys = masterProviderKeys.filter(k => k.status === 'active').length;
   const rateLimitedKeys = masterProviderKeys.filter(k => k.status === 'rate_limited').length;
+  const avgLatencyMs = masterLogs.length > 0
+    ? Math.round(masterLogs.reduce((acc, log) => acc + (log.latencyMs || 0), 0) / masterLogs.length)
+    : 0;
 
   res.json({
     totalRequests,
     totalTokens,
     totalCost,
+    avgLatencyMs,
     activeKeys,
     rateLimitedKeys,
     totalProviderKeys: masterProviderKeys.length,
     totalModels: masterModels.size,
-    firestoreBridge: getFirestoreBridgeStatus(),
+    rtdbBridge: getRtdbBridgeStatus(),
     logs: masterLogs.slice(0, 50)
   });
 });

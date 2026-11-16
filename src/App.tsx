@@ -1,24 +1,13 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { onAuthStateChanged, signOut, User } from 'firebase/auth';
-import { 
-  doc, 
-  setDoc, 
-  getDoc, 
-  deleteDoc,
-  collection,
-  getDocs,
-  onSnapshot,
-  writeBatch,
-  query,
-  where
-} from 'firebase/firestore';
-import { 
-  auth, 
-  db, 
-  isUserAdmin, 
-  handleFirestoreError,
-  OperationType,
-  testConnection
+import { ref, get, set, update, remove, onValue } from 'firebase/database';
+import {
+  auth,
+  rtdb,
+  isUserAdmin,
+  toRtdbKey,
+  sanitizeForRtdb,
+  testRtdbConnection
 } from './lib/firebase';
 import { ApiKey, ProviderKey, GatewayModel, RequestLog, UserProfile } from './types/gateway';
 import { ToastProvider, useToast } from './components/Toast';
@@ -34,12 +23,19 @@ import { LoginModal } from './components/LoginModal';
 import { LandingPage } from './components/LandingPage';
 import { parseJsonSafe } from './lib/http';
 
+function rtdbMapToList<T>(val: unknown): T[] {
+  if (!val || typeof val !== 'object') return [];
+  if (Array.isArray(val)) return val.filter(Boolean) as T[];
+  return Object.entries(val as Record<string, any>)
+    .filter(([, item]) => item && typeof item === 'object')
+    .map(([key, item]) => ({ ...item, id: item.id || key })) as T[];
+}
+
 function GatewayApp() {
   const { showToast } = useToast();
 
   // Auth & Profile
   const [currentUser, setCurrentUser] = useState<User | null>(null);
-  const [devUser, setDevUser] = useState<{ email: string; displayName: string; uid: string } | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [showAuthModal, setShowAuthModal] = useState(false);
@@ -48,25 +44,30 @@ function GatewayApp() {
   const [activeTab, setActiveTab] = useState<NavTab>('dashboard');
   const [isLoginRoute, setIsLoginRoute] = useState<boolean>(false);
 
-  // Gateway Keys & State
+  // Gateway Keys & State (100% live from Firebase RTDB + Node.js Gateway)
   const [apiKeys, setApiKeys] = useState<ApiKey[]>([]);
   const [providerKeys, setProviderKeys] = useState<ProviderKey[]>([]);
   const [models, setModels] = useState<GatewayModel[]>([]);
   const [requestLogs, setRequestLogs] = useState<RequestLog[]>([]);
+  const [publicStats, setPublicStats] = useState<{
+    totalRequests: number;
+    avgLatencyMs: number;
+    activeKeys: number;
+  }>({ totalRequests: 0, avgLatencyMs: 0, activeKeys: 0 });
   const [selectedKeyForPlayground, setSelectedKeyForPlayground] = useState<string>('');
 
   // Active user details
-  const activeEmail = currentUser?.email || devUser?.email;
-  const activeUid = currentUser?.uid || devUser?.uid || 'usr_developer';
+  const activeEmail = currentUser?.email || undefined;
+  const activeUid = currentUser?.uid || '';
   const isAdmin = isUserAdmin(activeEmail, userProfile?.role);
-  const isAuthenticated = Boolean(currentUser || devUser);
+  const isAuthenticated = Boolean(currentUser);
 
   // Sync with URL routing
   useEffect(() => {
     const checkPath = () => {
       const path = window.location.pathname.toLowerCase();
       const hash = window.location.hash.toLowerCase();
-      
+
       if (path === '/login' || hash === '#login') {
         setIsLoginRoute(true);
       } else {
@@ -79,7 +80,7 @@ function GatewayApp() {
       else if (path.includes('/models') || hash === '#models') setActiveTab('models');
       else if (path.includes('/settings') || hash === '#settings') setActiveTab('settings');
       else if (path === '/login' || hash === '#login') {
-        // preserve current tab or default to dashboard
+        // preserve current tab
       } else {
         setActiveTab('dashboard');
       }
@@ -114,22 +115,8 @@ function GatewayApp() {
     }
   };
 
-  // Helper to strip undefined and null fields before writing to Firestore
-  const sanitizeForFirestore = <T extends Record<string, any>>(obj: T): Partial<T> => {
-    const clean: Record<string, any> = {};
-    for (const [k, v] of Object.entries(obj)) {
-      if (v !== undefined && v !== null) clean[k] = v;
-    }
-    return clean as Partial<T>;
-  };
-
-  const toFirestoreDocId = (rawId: string): string => {
-    const sanitized = rawId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 128);
-    return sanitized || 'id_' + Math.random().toString(36).substring(2, 10);
-  };
-
-  // Strict allowlist + size sanitization matching firestore.rules isValidProviderKey
-  const buildSafeProviderKeyDoc = (pk: ProviderKey): Record<string, any> => {
+  // Strict sanitization for Realtime Database ProviderKey entries
+  const buildSafeProviderKeyRecord = (pk: ProviderKey): Record<string, any> => {
     const nowIso = new Date().toISOString().slice(0, 64);
     const keyStr = String(pk.key || '').slice(0, 512);
     const hint = (pk.keyHint || (keyStr.length > 8 ? `${keyStr.slice(0, 4)}...${keyStr.slice(-4)}` : keyStr)).slice(0, 32);
@@ -137,8 +124,8 @@ function GatewayApp() {
       ? pk.status
       : 'active';
 
-    return sanitizeForFirestore({
-      id: toFirestoreDocId(String(pk.id || 'pk_key')).slice(0, 128),
+    return sanitizeForRtdb({
+      id: toRtdbKey(String(pk.id || 'pk_key')).slice(0, 128),
       provider: String(pk.provider || 'custom').slice(0, 64),
       key: keyStr,
       keyHint: hint || undefined,
@@ -157,10 +144,9 @@ function GatewayApp() {
     });
   };
 
-  // Strict allowlist + size sanitization matching firestore.rules isValidGatewayModel
-  const buildSafeModelDoc = (m: GatewayModel): Record<string, any> => {
+  const buildSafeModelRecord = (m: GatewayModel): Record<string, any> => {
     const nowIso = new Date().toISOString().slice(0, 64);
-    return sanitizeForFirestore({
+    return sanitizeForRtdb({
       id: String(m.id).slice(0, 128),
       name: String(m.name || m.id).slice(0, 128),
       provider: String(m.provider || 'custom').slice(0, 64),
@@ -177,7 +163,6 @@ function GatewayApp() {
     });
   };
 
-  // Helper to obtain the authenticated user's Firebase ID token for backend Firestore REST operations
   const getFirebaseIdToken = useCallback(async (): Promise<string | undefined> => {
     try {
       if (auth.currentUser) {
@@ -189,7 +174,7 @@ function GatewayApp() {
     return undefined;
   }, []);
 
-  // Sync state with backend memory router (keys + models from Admin Panel)
+  // Sync live RTDB state with Node.js gateway router memory
   const syncWithBackend = useCallback(async (
     currentApiKeys: ApiKey[],
     currentProviderKeys: ProviderKey[],
@@ -216,20 +201,32 @@ function GatewayApp() {
     }
   }, [getFirebaseIdToken]);
 
-  // Firebase Auth State Listener — checks Rouinmajhi@gmail.com for Admin role & runs daily 50B credits reset
+  const syncModelsToRtdb = useCallback(async (modelsList: GatewayModel[]) => {
+    if (!currentUser || !isAdmin) return;
+    try {
+      const modelMap: Record<string, any> = {};
+      for (const m of modelsList) {
+        if (!m?.id) continue;
+        modelMap[toRtdbKey(m.id)] = buildSafeModelRecord(m);
+      }
+      await set(ref(rtdb, 'models'), Object.keys(modelMap).length > 0 ? modelMap : null);
+    } catch (err) {
+      console.warn('RTDB models sync error:', err);
+    }
+  }, [currentUser, isAdmin]);
+
+  // Firebase Auth State Listener — checks Rouinmajhi@gmail.com for Admin role & runs daily 50B credits reset in RTDB
   useEffect(() => {
     const DAILY_CREDITS = 50_000_000_000;
 
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
       setCurrentUser(user);
       if (user) {
-        setDevUser(null);
         const isAdm = isUserAdmin(user.email);
         const expectedRole: 'admin' | 'user' = isAdm ? 'admin' : 'user';
         const today = new Date().toISOString().slice(0, 10);
         const nowIso = new Date().toISOString();
 
-        // Notify backend session for role verification and daily credits reset
         fetch('/api/auth/session', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -241,11 +238,11 @@ function GatewayApp() {
         }).catch(() => {});
 
         try {
-          const profileRef = doc(db, 'user_profiles', user.uid);
-          const snap = await getDoc(profileRef);
+          const profileRef = ref(rtdb, `user_profiles/${toRtdbKey(user.uid)}`);
+          const snap = await get(profileRef);
 
           if (snap.exists()) {
-            const existing = snap.data() as UserProfile;
+            const existing = snap.val() as UserProfile;
             const needsDailyReset =
               !existing.updatedAt ||
               existing.updatedAt.slice(0, 10) !== today ||
@@ -254,8 +251,10 @@ function GatewayApp() {
 
             const updatedProfile: UserProfile = {
               ...existing,
+              uid: user.uid,
               email: user.email || existing.email,
               displayName: user.displayName || existing.displayName || 'Developer',
+              photoURL: user.photoURL || existing.photoURL,
               role: expectedRole,
               freeCreditsAllocated: DAILY_CREDITS,
               freeCreditsSpent: needsDailyReset ? 0 : (existing.freeCreditsSpent || 0),
@@ -263,15 +262,7 @@ function GatewayApp() {
             };
 
             if (needsDailyReset || needsRoleUpdate) {
-              try {
-                await setDoc(profileRef, sanitizeForFirestore(updatedProfile));
-              } catch (writeErr) {
-                try {
-                  handleFirestoreError(writeErr, OperationType.UPDATE, `user_profiles/${user.uid}`);
-                } catch {
-                  // Non-blocking fallback
-                }
-              }
+              await set(profileRef, sanitizeForRtdb(updatedProfile)).catch(() => {});
             }
             setUserProfile(updatedProfile);
           } else {
@@ -288,18 +279,10 @@ function GatewayApp() {
               createdAt: nowIso,
               updatedAt: nowIso
             };
-            try {
-              await setDoc(profileRef, sanitizeForFirestore(initialProfile));
-            } catch (writeErr) {
-              try {
-                handleFirestoreError(writeErr, OperationType.CREATE, `user_profiles/${user.uid}`);
-              } catch {
-                // Non-blocking fallback
-              }
-            }
+            await set(profileRef, sanitizeForRtdb(initialProfile)).catch(() => {});
             setUserProfile(initialProfile);
           }
-        } catch (err) {
+        } catch {
           setUserProfile({
             uid: user.uid,
             email: user.email || '',
@@ -322,72 +305,84 @@ function GatewayApp() {
     return () => unsubscribe();
   }, []);
 
-  // Initialize data directly from Firebase Firestore (aisdd-6f89e) & sync gateway router
+  // Initialize data directly from Firebase Realtime Database (aisdd-6f89e-default-rtdb) & Node.js server
   useEffect(() => {
     let cancelled = false;
 
     const initializeData = async () => {
-      testConnection();
+      testRtdbConnection();
 
       let loadedModels: GatewayModel[] = [];
       let loadedApiKeys: ApiKey[] = [];
       let loadedProviderKeys: ProviderKey[] = [];
-      let adminFirestoreLoaded = false;
+      let adminRtdbLoaded = false;
 
       if (currentUser) {
-        // 1. Always read User's Gateway API Keys directly from Firebase Firestore
+        // 1. Read user's sk-gateway API keys from RTDB
         try {
-          const keysQ = query(collection(db, 'api_keys'), where('userId', '==', currentUser.uid));
-          const keysSnap = await getDocs(keysQ);
-          loadedApiKeys = keysSnap.docs.map(d => d.data() as ApiKey);
-        } catch (err) {
-          try {
-            handleFirestoreError(err, OperationType.LIST, 'api_keys');
-          } catch {
-            // Structured error logged
+          const keysSnap = await get(ref(rtdb, 'api_keys'));
+          if (keysSnap.exists()) {
+            loadedApiKeys = rtdbMapToList<ApiKey>(keysSnap.val())
+              .filter(k => k.userId === currentUser.uid)
+              .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
           }
+        } catch (err) {
+          console.warn('Could not read api_keys from RTDB:', err);
         }
 
-        // 2. Always read Live Models directly from Firebase Firestore (authoritative source)
+        // 2. Read live models from RTDB
         try {
-          const modelsSnap = await getDocs(collection(db, 'models'));
-          loadedModels = modelsSnap.docs
-            .map(d => d.data() as GatewayModel)
-            .filter(m => Boolean(m?.id && m?.ownerKeyId))
-            .sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
-        } catch (err) {
-          try {
-            handleFirestoreError(err, OperationType.GET, 'models');
-          } catch {
-            // Structured error logged
+          const modelsSnap = await get(ref(rtdb, 'models'));
+          if (modelsSnap.exists()) {
+            loadedModels = rtdbMapToList<GatewayModel>(modelsSnap.val())
+              .filter(m => Boolean(m?.id && m?.ownerKeyId))
+              .sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
           }
+        } catch (err) {
+          console.warn('Could not read models from RTDB:', err);
         }
 
-        // 3. If Admin, always read Master Provider Key Pool directly from Firebase Firestore
+        // 3. Read live request logs from RTDB
+        try {
+          const logsSnap = await get(ref(rtdb, 'request_logs'));
+          if (logsSnap.exists()) {
+            const allLogs = rtdbMapToList<RequestLog>(logsSnap.val())
+              .filter(l => isAdmin || l.userId === currentUser.uid)
+              .sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''))
+              .slice(0, 200);
+            if (!cancelled) setRequestLogs(allLogs);
+          }
+        } catch {
+          // Ignore if no logs yet
+        }
+
+        // 4. If Admin, read Master Provider Key Pool from RTDB
         if (isAdmin) {
           try {
-            const pkSnap = await getDocs(collection(db, 'provider_keys'));
-            const byKey = new Map<string, ProviderKey>();
-            for (const d of pkSnap.docs) {
-              const pk = d.data() as ProviderKey;
-              if (pk?.key) byKey.set(pk.key, pk);
+            const pkSnap = await get(ref(rtdb, 'provider_keys'));
+            if (pkSnap.exists()) {
+              const byKey = new Map<string, ProviderKey>();
+              for (const pk of rtdbMapToList<ProviderKey>(pkSnap.val())) {
+                if (pk?.key) byKey.set(pk.key, pk);
+              }
+              loadedProviderKeys = Array.from(byKey.values()).sort((a, b) =>
+                (b.createdAt || '').localeCompare(a.createdAt || '')
+              );
             }
-            loadedProviderKeys = Array.from(byKey.values());
-            adminFirestoreLoaded = true;
+            adminRtdbLoaded = true;
           } catch (err) {
-            try {
-              handleFirestoreError(err, OperationType.GET, 'provider_keys');
-            } catch {
-              // Structured error logged
-            }
+            console.warn('Could not read provider_keys from RTDB:', err);
           }
         }
       } else {
-        // Public landing page: fetch active models from gateway endpoint
+        // Public landing page: fetch live discovered models & stats from Node.js server
         try {
-          const res = await fetch('/api/models');
-          if (res.ok) {
-            const data = await parseJsonSafe(res);
+          const [modelsRes, statsRes] = await Promise.all([
+            fetch('/api/models'),
+            fetch('/api/stats')
+          ]);
+          if (modelsRes.ok) {
+            const data = await parseJsonSafe(modelsRes);
             if (Array.isArray(data.data)) {
               loadedModels = data.data.map((m: any) => ({
                 id: m.id,
@@ -399,25 +394,17 @@ function GatewayApp() {
               }));
             }
           }
+          if (statsRes.ok && !cancelled) {
+            const s = await parseJsonSafe(statsRes);
+            setPublicStats({
+              totalRequests: Number(s.totalRequests || 0),
+              avgLatencyMs: Number(s.avgLatencyMs || 0),
+              activeKeys: Number(s.activeKeys || 0)
+            });
+          }
         } catch (e) {
           console.warn('Failed to load public models:', e);
         }
-      }
-
-      // Fetch live stats & logs
-      try {
-        const fbToken = await getFirebaseIdToken();
-        const statsRes = await fetch('/api/stats', {
-          headers: fbToken ? { 'x-firebase-token': fbToken } : {}
-        });
-        if (statsRes.ok) {
-          const statsData = await parseJsonSafe(statsRes);
-          if (!cancelled && Array.isArray(statsData.logs)) {
-            setRequestLogs(statsData.logs);
-          }
-        }
-      } catch {
-        // Ignore
       }
 
       if (cancelled) return;
@@ -426,13 +413,12 @@ function GatewayApp() {
       setApiKeys(loadedApiKeys);
       setProviderKeys(loadedProviderKeys);
 
-      // Hydrate backend router memory cleanly from Firestore's authoritative records
       if (currentUser) {
         await syncWithBackend(
           loadedApiKeys,
           isAdmin ? loadedProviderKeys : [],
           loadedModels,
-          isAdmin && adminFirestoreLoaded
+          isAdmin && adminRtdbLoaded
         );
       }
     };
@@ -441,64 +427,72 @@ function GatewayApp() {
     return () => {
       cancelled = true;
     };
-  }, [currentUser, isAdmin, syncWithBackend, getFirebaseIdToken]);
+  }, [currentUser, isAdmin, syncWithBackend]);
 
-  // Real-time Firestore listener so User Panel automatically reflects all synced models
+  // Real-time RTDB listener for /models
   useEffect(() => {
     if (!currentUser) return;
-    const unsubscribe = onSnapshot(
-      collection(db, 'models'),
+    const unsubscribe = onValue(
+      ref(rtdb, 'models'),
       (snapshot) => {
-        const liveModels = snapshot.docs
-          .map((d) => d.data() as GatewayModel)
+        const liveModels = rtdbMapToList<GatewayModel>(snapshot.val())
           .filter((m) => Boolean(m?.id && m?.ownerKeyId))
           .sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
         setModels(liveModels);
       },
       (error) => {
-        try {
-          handleFirestoreError(error, OperationType.GET, 'models');
-        } catch {
-          // Structured error logged
-        }
+        console.warn('RTDB models listener error:', error);
       }
     );
     return () => unsubscribe();
   }, [currentUser]);
 
-  // Real-time Firestore listener for User's Gateway API Keys
+  // Real-time RTDB listener for user's /api_keys
   useEffect(() => {
     if (!currentUser) return;
-    const keysQ = query(collection(db, 'api_keys'), where('userId', '==', currentUser.uid));
-    const unsubscribe = onSnapshot(
-      keysQ,
+    const unsubscribe = onValue(
+      ref(rtdb, 'api_keys'),
       (snapshot) => {
-        const liveApiKeys = snapshot.docs
-          .map((d) => d.data() as ApiKey)
+        const liveApiKeys = rtdbMapToList<ApiKey>(snapshot.val())
+          .filter((k) => k.userId === currentUser.uid)
           .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
         setApiKeys(liveApiKeys);
         syncWithBackend(liveApiKeys, [], undefined, false).catch(() => {});
       },
       (error) => {
-        try {
-          handleFirestoreError(error, OperationType.LIST, 'api_keys');
-        } catch {
-          // Structured error logged
-        }
+        console.warn('RTDB api_keys listener error:', error);
       }
     );
     return () => unsubscribe();
   }, [currentUser, syncWithBackend]);
 
-  // Real-time Firestore listener for Admin Provider Pool (authoritative real-time sync)
+  // Real-time RTDB listener for /request_logs
+  useEffect(() => {
+    if (!currentUser) return;
+    const unsubscribe = onValue(
+      ref(rtdb, 'request_logs'),
+      (snapshot) => {
+        const liveLogs = rtdbMapToList<RequestLog>(snapshot.val())
+          .filter((l) => isAdmin || l.userId === currentUser.uid)
+          .sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''))
+          .slice(0, 200);
+        setRequestLogs(liveLogs);
+      },
+      (error) => {
+        console.warn('RTDB request_logs listener error:', error);
+      }
+    );
+    return () => unsubscribe();
+  }, [currentUser, isAdmin]);
+
+  // Real-time RTDB listener for Admin /provider_keys
   useEffect(() => {
     if (!currentUser || !isAdmin) return;
-    const unsubscribe = onSnapshot(
-      collection(db, 'provider_keys'),
+    const unsubscribe = onValue(
+      ref(rtdb, 'provider_keys'),
       (snapshot) => {
         const byKey = new Map<string, ProviderKey>();
-        for (const d of snapshot.docs) {
-          const pk = d.data() as ProviderKey;
+        for (const pk of rtdbMapToList<ProviderKey>(snapshot.val())) {
           if (pk?.key) byKey.set(pk.key, pk);
         }
         const docs = Array.from(byKey.values()).sort((a, b) =>
@@ -508,181 +502,77 @@ function GatewayApp() {
         syncWithBackend([], docs, undefined, true).catch(() => {});
       },
       (error) => {
-        try {
-          handleFirestoreError(error, OperationType.GET, 'provider_keys');
-        } catch {
-          // Structured error logged
-        }
+        console.warn('RTDB provider_keys listener error:', error);
       }
     );
     return () => unsubscribe();
   }, [currentUser, isAdmin, syncWithBackend]);
 
-  // Dev Quick Login for testing inside sandboxes
-  const handleDevQuickLogin = (email: string, displayName: string) => {
-    const isAdm = isUserAdmin(email);
-    const mockUid = 'usr_' + email.replace(/[^a-zA-Z0-9]/g, '_');
-    setDevUser({ email, displayName, uid: mockUid });
-    setUserProfile({
-      uid: mockUid,
-      email,
-      displayName,
-      role: isAdm ? 'admin' : 'user',
-      freeCreditsAllocated: 0,
-      freeCreditsSpent: 0,
-      totalRequests: 0,
-      totalTokens: 0,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    });
-    showToast('Signed In', `Welcome back, ${displayName}!`, 'success');
-  };
-
   const handleSignOut = async () => {
     if (currentUser) {
       await signOut(auth);
     }
-    setDevUser(null);
     setUserProfile(null);
+    setApiKeys([]);
+    setProviderKeys([]);
+    setRequestLogs([]);
     showToast('Signed Out', 'You have been disconnected from the session.', 'info');
   };
 
-  // Create Gateway API Key (persists to Backend /api/keys + Firestore api_keys)
+  // Create Gateway API Key via Node.js server -> generated sk-gateway-... saved directly in Firebase RTDB
   const handleCreateApiKey = async (name: string): Promise<ApiKey> => {
-    const randomHex = Array.from(crypto.getRandomValues(new Uint8Array(16)))
-      .map(b => b.toString(16).padStart(2, '0'))
-      .join('');
-    const fullKey = `sk-gateway-${randomHex}`;
-
-    let newKey: ApiKey = {
-      id: 'key_' + Math.random().toString(36).substring(2, 10),
-      userId: activeUid,
-      name,
-      key: fullKey,
-      keyPrefix: `${fullKey.slice(0, 11)}...${fullKey.slice(-4)}`,
-      status: 'active',
-      totalRequests: 0,
-      totalTokens: 0,
-      createdAt: new Date().toISOString()
-    };
+    if (!currentUser) {
+      throw new Error('Please sign in first to generate an API key.');
+    }
 
     const fbToken = await getFirebaseIdToken();
-    try {
-      const res = await fetch('/api/keys', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(fbToken ? { 'x-firebase-token': fbToken } : {})
-        },
-        body: JSON.stringify({
-          id: newKey.id,
-          userId: newKey.userId,
-          name: newKey.name,
-          key: newKey.key
-        })
-      });
-      if (res.ok) {
-        const data = await parseJsonSafe(res);
-        if (data?.key?.key) {
-          newKey = data.key as ApiKey;
-        }
-      }
-    } catch {
-      // Fallback to client-generated key + sync
+    const res = await fetch('/api/keys', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(fbToken ? { 'x-firebase-token': fbToken } : {})
+      },
+      body: JSON.stringify({
+        userId: currentUser.uid,
+        name
+      })
+    });
+
+    const data = await parseJsonSafe(res);
+    if (!res.ok || !data?.key?.key) {
+      throw new Error(data?.error || 'Node.js gateway failed to generate API key.');
     }
 
-    const updated = [newKey, ...apiKeys];
-    setApiKeys(updated);
+    const createdKey = data.key as ApiKey;
 
-    if (currentUser) {
-      try {
-        await setDoc(doc(db, 'api_keys', newKey.id), sanitizeForFirestore(newKey));
-      } catch (err) {
-        try {
-          handleFirestoreError(err, OperationType.CREATE, `api_keys/${newKey.id}`);
-        } catch {
-          // Non-blocking fallback
-        }
-      }
+    // Guarantee RTDB persistence if server didn't have direct RTDB auth
+    if (!data.persistedToDb) {
+      await set(ref(rtdb, `api_keys/${toRtdbKey(createdKey.id)}`), sanitizeForRtdb(createdKey));
     }
 
-    syncWithBackend(updated, providerKeys);
-    return newKey;
+    setApiKeys((prev) => {
+      const filtered = prev.filter(k => k.id !== createdKey.id && k.key !== createdKey.key);
+      return [createdKey, ...filtered];
+    });
+
+    return createdKey;
   };
 
-  // Delete Gateway API Key (removes from Backend /api/keys + Firestore api_keys)
+  // Delete Gateway API Key from Node.js server + Firebase RTDB
   const handleDeleteApiKey = async (keyId: string) => {
-    const updated = apiKeys.filter(k => k.id !== keyId);
-    setApiKeys(updated);
+    setApiKeys((prev) => prev.filter(k => k.id !== keyId));
 
     const fbToken = await getFirebaseIdToken();
-    try {
-      await fetch(`/api/keys/${encodeURIComponent(keyId)}`, {
+    await Promise.all([
+      fetch(`/api/keys/${encodeURIComponent(keyId)}`, {
         method: 'DELETE',
         headers: fbToken ? { 'x-firebase-token': fbToken } : {}
-      });
-    } catch {
-      // Ignore network fallback
-    }
-
-    if (currentUser) {
-      try {
-        await deleteDoc(doc(db, 'api_keys', keyId));
-      } catch (err) {
-        try {
-          handleFirestoreError(err, OperationType.DELETE, `api_keys/${keyId}`);
-        } catch {
-          // Non-blocking fallback
-        }
-      }
-    }
-
-    syncWithBackend(updated, providerKeys);
+      }).catch(() => {}),
+      remove(ref(rtdb, `api_keys/${toRtdbKey(keyId)}`)).catch(() => {})
+    ]);
   };
 
-  // Persist discovered models list to Firestore atomically in batches (Admin only)
-  const syncModelsToFirestore = useCallback(async (modelsList: GatewayModel[]) => {
-    if (!currentUser || !isAdmin) return;
-    try {
-      const existingSnap = await getDocs(collection(db, 'models'));
-      const activeDocIds = new Set(modelsList.map(m => toFirestoreDocId(m.id)));
-      const ops: Array<{ type: 'delete' | 'set'; id: string; data?: Record<string, any> }> = [];
-
-      for (const d of existingSnap.docs) {
-        if (!activeDocIds.has(d.id)) {
-          ops.push({ type: 'delete', id: d.id });
-        }
-      }
-      for (const m of modelsList) {
-        ops.push({
-          type: 'set',
-          id: toFirestoreDocId(m.id),
-          data: buildSafeModelDoc(m)
-        });
-      }
-
-      for (let i = 0; i < ops.length; i += 400) {
-        const batch = writeBatch(db);
-        for (const op of ops.slice(i, i + 400)) {
-          const ref = doc(db, 'models', op.id);
-          if (op.type === 'delete') {
-            batch.delete(ref);
-          } else if (op.data) {
-            batch.set(ref, op.data);
-          }
-        }
-        await batch.commit();
-      }
-    } catch (err) {
-      try {
-        handleFirestoreError(err, OperationType.WRITE, 'models');
-      } catch {
-        // Logged structured FirestoreErrorInfo
-      }
-    }
-  }, [currentUser, isAdmin]);
-
-  // Admin Bulk Add Provider Keys & Auto-Discover Models (atomic batch Firestore persistence)
+  // Admin Bulk Add Provider Keys & Auto-Discover Models -> saved directly in Firebase RTDB
   const handleAddBulkProviderKeys = async (keysText: string, provider: string, customBaseUrl?: string) => {
     const fbToken = await getFirebaseIdToken();
     const res = await fetch('/api/admin/bulk-add-keys', {
@@ -718,6 +608,8 @@ function GatewayApp() {
             id: m.id,
             name: m.name || m.id.replace(/[-_]/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
             provider: m.provider || m.owned_by || 'custom',
+            ownerKeyId: m.ownerKeyId,
+            ownerKeyHint: m.ownerKeyHint,
             discoveredAt: new Date().toISOString()
           }));
           setModels(nextModels);
@@ -754,29 +646,22 @@ function GatewayApp() {
         return Array.from(byKey.values());
       });
 
-      // Persist all new/updated keys & discovered models atomically in Firestore batches
+      // Guarantee Realtime Database persistence via client SDK if server RTDB write didn't complete all items
       if (currentUser && isAdmin) {
         try {
-          for (let i = 0; i < upsertedKeys.length; i += 400) {
-            const batch = writeBatch(db);
-            for (const pk of upsertedKeys.slice(i, i + 400)) {
-              const safeDoc = buildSafeProviderKeyDoc(pk);
-              batch.set(doc(db, 'provider_keys', safeDoc.id), safeDoc);
-            }
-            await batch.commit();
+          const updates: Record<string, any> = {};
+          for (const pk of upsertedKeys) {
+            const safeRecord = buildSafeProviderKeyRecord(pk);
+            updates[`provider_keys/${safeRecord.id}`] = safeRecord;
           }
-          await syncModelsToFirestore(nextModels);
+          await update(ref(rtdb), updates);
+          await syncModelsToRtdb(nextModels);
         } catch (err: any) {
           showToast(
-            'Firestore Persistence Warning',
-            err?.message || 'Keys added in gateway memory, but Firestore write was rejected. Check Admin auth/rules.',
+            'RTDB Persistence Warning',
+            err?.message || 'Keys active in gateway, but RTDB write failed. Check RTDB rules.',
             'error'
           );
-          try {
-            handleFirestoreError(err, OperationType.WRITE, 'provider_keys');
-          } catch {
-            // Structured error logged
-          }
         }
       }
     }
@@ -790,7 +675,9 @@ function GatewayApp() {
 
   const handleToggleKeyStatus = async (keyId: string, currentStatus: string) => {
     const newStatus = currentStatus === 'disabled' ? 'active' : 'disabled';
-    const updated = providerKeys.map(k => k.id === keyId ? { ...k, status: newStatus as any, updatedAt: new Date().toISOString() } : k);
+    const updated = providerKeys.map(k =>
+      k.id === keyId ? { ...k, status: newStatus as any, updatedAt: new Date().toISOString() } : k
+    );
     setProviderKeys(updated);
 
     const fbToken = await getFirebaseIdToken();
@@ -808,7 +695,7 @@ function GatewayApp() {
         const data = await parseJsonSafe(res);
         if (Array.isArray(data.models)) {
           setModels(data.models);
-          await syncModelsToFirestore(data.models);
+          await syncModelsToRtdb(data.models);
         }
       } else {
         await syncWithBackend(apiKeys, updated, undefined, true);
@@ -820,16 +707,8 @@ function GatewayApp() {
     if (currentUser && isAdmin) {
       const target = updated.find(k => k.id === keyId);
       if (target) {
-        try {
-          const safeDoc = buildSafeProviderKeyDoc(target);
-          await setDoc(doc(db, 'provider_keys', safeDoc.id), safeDoc);
-        } catch (err) {
-          try {
-            handleFirestoreError(err, OperationType.WRITE, `provider_keys/${keyId}`);
-          } catch {
-            // Structured error logged
-          }
-        }
+        const safeRecord = buildSafeProviderKeyRecord(target);
+        await set(ref(rtdb, `provider_keys/${safeRecord.id}`), safeRecord).catch(() => {});
       }
     }
 
@@ -853,7 +732,7 @@ function GatewayApp() {
         const data = await parseJsonSafe(res);
         if (Array.isArray(data.models)) {
           setModels(data.models);
-          await syncModelsToFirestore(data.models);
+          await syncModelsToRtdb(data.models);
         }
       }
     } catch {
@@ -861,11 +740,7 @@ function GatewayApp() {
     }
 
     if (currentUser && isAdmin) {
-      try {
-        await deleteDoc(doc(db, 'provider_keys', toFirestoreDocId(keyId)));
-      } catch (err) {
-        console.warn('Could not delete provider_key from Firestore:', err);
-      }
+      await remove(ref(rtdb, `provider_keys/${toRtdbKey(keyId)}`)).catch(() => {});
     }
 
     showToast('Key Removed', 'Provider key removed from Master Pool.', 'info');
@@ -894,22 +769,13 @@ function GatewayApp() {
     }
 
     if (currentUser && isAdmin) {
-      const activeKeysToSave = updated.filter(pk => pk.status === 'active');
-      for (let i = 0; i < activeKeysToSave.length; i += 400) {
-        try {
-          const batch = writeBatch(db);
-          for (const pk of activeKeysToSave.slice(i, i + 400)) {
-            const safeDoc = buildSafeProviderKeyDoc(pk);
-            batch.set(doc(db, 'provider_keys', safeDoc.id), safeDoc);
-          }
-          await batch.commit();
-        } catch (err) {
-          try {
-            handleFirestoreError(err, OperationType.WRITE, 'provider_keys');
-          } catch {
-            // Structured error logged
-          }
-        }
+      const updates: Record<string, any> = {};
+      for (const pk of updated) {
+        const safeRecord = buildSafeProviderKeyRecord(pk);
+        updates[`provider_keys/${safeRecord.id}`] = safeRecord;
+      }
+      if (Object.keys(updates).length > 0) {
+        await update(ref(rtdb), updates).catch(() => {});
       }
     }
 
@@ -935,29 +801,31 @@ function GatewayApp() {
         }));
         setModels(nextModels);
         if (isAdmin) {
-          await syncModelsToFirestore(nextModels);
+          await syncModelsToRtdb(nextModels);
         }
         showToast('Models Synced', `${nextModels.length} live model(s) synced from active keys.`, 'success');
         return;
       }
 
-      const fallbackRes = await fetch('/api/models');
-      const fallbackData = await parseJsonSafe(fallbackRes);
-      if (Array.isArray(fallbackData.data)) {
-        setModels(fallbackData.data.map((m: any) => ({
+      const liveRes = await fetch('/api/models');
+      const liveData = await parseJsonSafe(liveRes);
+      if (Array.isArray(liveData.data)) {
+        setModels(liveData.data.map((m: any) => ({
           id: m.id,
           name: m.name || m.id.replace(/[-_]/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
           provider: m.provider || m.owned_by || 'custom',
-          discoveredAt: new Date().toISOString()
+          ownerKeyId: m.ownerKeyId,
+          ownerKeyHint: m.ownerKeyHint,
+          discoveredAt: m.discoveredAt || new Date().toISOString()
         })));
-        showToast('Models Refreshed', `${fallbackData.data.length} live model(s) loaded.`, 'success');
+        showToast('Models Refreshed', `${liveData.data.length} live model(s) loaded.`, 'success');
       }
     } catch (e: any) {
       showToast('Refresh Error', e.message, 'error');
     }
   };
 
-  // Real Metrics Calculation from live telemetry logs & keys
+  // Real Metrics Calculation from live RTDB telemetry logs & keys
   const totalRequestsSum = Math.max(
     requestLogs.length,
     apiKeys.reduce((acc, k) => acc + (k.totalRequests || 0), 0) + (userProfile?.totalRequests || 0)
@@ -970,13 +838,17 @@ function GatewayApp() {
   const realPromptTokens = requestLogs.reduce((acc, l) => acc + (l.promptTokens || 0), 0);
   const realCompletionTokens = requestLogs.reduce((acc, l) => acc + (l.completionTokens || 0), 0);
 
-  const promptTokensCount = requestLogs.length > 0 ? realPromptTokens : Math.round(totalTokensSum * 0.38);
-  const completionTokensCount = requestLogs.length > 0 ? realCompletionTokens : Math.round(totalTokensSum * 0.62);
+  const promptTokensCount = realPromptTokens > 0 || requestLogs.length > 0
+    ? realPromptTokens
+    : 0;
+  const completionTokensCount = realCompletionTokens > 0 || requestLogs.length > 0
+    ? realCompletionTokens
+    : totalTokensSum;
 
   const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
   const realDailyUsage = requestLogs.filter(l => new Date(l.timestamp).getTime() >= oneDayAgo).length;
 
-  // If user navigated to /login or clicked "Get Free API Key" or clicked "Sign In"
+  // If user navigated to /login or clicked "Get Free API Key"
   if (!isAuthenticated && (isLoginRoute || showAuthModal)) {
     return (
       <LoginModal
@@ -989,7 +861,6 @@ function GatewayApp() {
         onSuccess={() => {
           setShowAuthModal(false);
           setIsLoginRoute(false);
-          // If they were trying to access /admin, keep it
           if (window.location.pathname.toLowerCase() === '/admin' || window.location.hash.toLowerCase() === '#admin') {
             setActiveTab('admin');
           }
@@ -1027,6 +898,7 @@ function GatewayApp() {
     return (
       <LandingPage
         models={models}
+        liveStats={publicStats}
         onGetFreeApiKey={() => {
           setIsLoginRoute(true);
           window.history.pushState(null, '', '/login');
@@ -1053,7 +925,7 @@ function GatewayApp() {
     return (
       <StandaloneAdminDashboard
         userEmail={activeEmail}
-        userDisplayName={currentUser?.displayName || devUser?.displayName}
+        userDisplayName={currentUser?.displayName || undefined}
         isAdmin={isAdmin}
         providerKeys={providerKeys}
         models={models}
@@ -1075,7 +947,7 @@ function GatewayApp() {
       <Sidebar
         currentTab={activeTab}
         onSelectTab={handleSelectTab}
-        user={currentUser || devUser}
+        user={currentUser}
         isAdmin={isAdmin}
         onLogout={handleSignOut}
       />
@@ -1085,7 +957,7 @@ function GatewayApp() {
         {/* Minimalist Top Header */}
         <TopHeader
           currentTab={activeTab}
-          user={currentUser || devUser}
+          user={currentUser}
           onLogout={handleSignOut}
         />
 
@@ -1099,7 +971,7 @@ function GatewayApp() {
           </span>
         </div>
 
-        {/* Tab View Container - Standardized full width container */}
+        {/* Tab View Container */}
         <main className="flex-1 max-w-6xl w-full mx-auto px-6 sm:px-8 py-8">
           {activeTab === 'dashboard' && (
             <OverviewView

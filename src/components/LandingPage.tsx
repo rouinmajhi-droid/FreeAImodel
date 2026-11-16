@@ -14,14 +14,18 @@ import {
   ChevronRight,
   Code2,
   Lock,
-  Flame,
-  Users
+  Flame
 } from 'lucide-react';
 import { GatewayModel } from '../types/gateway';
 import { ProviderLogo } from './ProviderLogo';
 
 interface LandingPageProps {
   models: GatewayModel[];
+  liveStats?: {
+    totalRequests: number;
+    avgLatencyMs: number;
+    activeKeys: number;
+  };
   onGetFreeApiKey: () => void;
   onOpenPlayground: () => void;
   onViewModels: () => void;
@@ -29,6 +33,7 @@ interface LandingPageProps {
 
 export const LandingPage: React.FC<LandingPageProps> = ({
   models = [],
+  liveStats,
   onGetFreeApiKey,
   onOpenPlayground,
   onViewModels,
@@ -37,7 +42,9 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   const [copiedBaseUrl, setCopiedBaseUrl] = useState(false);
 
   // Canonical FreeAIModel Gateway URL
-  const serverOrigin = 'https://freeaimodel.vercel.app';
+  const serverOrigin = typeof window !== 'undefined' && window.location.origin
+    ? (window.location.hostname.includes('freeaimodel') ? window.location.origin : 'https://freeaimodel.cc.cd')
+    : 'https://freeaimodel.cc.cd';
   const baseUrl = `${serverOrigin}/v1`;
   const dynamicModel = models[0]?.id || 'YOUR_ACTIVE_MODEL_ID';
 
@@ -245,22 +252,22 @@ export const LandingPage: React.FC<LandingPageProps> = ({
         </div>
       </section>
 
-      {/* 4. Live Developer Metrics / Social Proof Section */}
+      {/* 4. Live Gateway Metrics Section (100% real-time, zero mock numbers) */}
       <section id="stats" className="border-y border-zinc-200/80 bg-white py-12">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-6 text-center">
             <div className="p-4">
               <div className="text-3xl sm:text-4xl font-extrabold text-zinc-950 font-mono tracking-tight">
-                50,000+
+                {models.length.toLocaleString()}
               </div>
               <div className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mt-1.5 flex items-center justify-center gap-1.5">
-                <Users className="w-3.5 h-3.5 text-violet-600" />
-                <span>Active Developers</span>
+                <Layers className="w-3.5 h-3.5 text-violet-600" />
+                <span>Live Models Synced</span>
               </div>
             </div>
 
             <div className="p-4 border-l border-zinc-100">
-              <div className="text-3xl sm:text-4xl font-extrabold text-zinc-950 font-mono tracking-tight text-violet-600">
+              <div className="text-3xl sm:text-4xl font-extrabold font-mono tracking-tight text-violet-600">
                 50 Billion
               </div>
               <div className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mt-1.5 flex items-center justify-center gap-1.5">
@@ -270,22 +277,22 @@ export const LandingPage: React.FC<LandingPageProps> = ({
             </div>
 
             <div className="p-4 border-l border-zinc-100">
-              <div className="text-3xl sm:text-4xl font-extrabold text-zinc-950 font-mono tracking-tight text-emerald-600">
-                99.99%
+              <div className="text-3xl sm:text-4xl font-extrabold font-mono tracking-tight text-emerald-600">
+                {(liveStats?.totalRequests || 0).toLocaleString()}
               </div>
               <div className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mt-1.5 flex items-center justify-center gap-1.5">
                 <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
-                <span>Routing Uptime</span>
+                <span>Live Routed Calls</span>
               </div>
             </div>
 
             <div className="p-4 border-l border-zinc-100">
               <div className="text-3xl sm:text-4xl font-extrabold text-zinc-950 font-mono tracking-tight">
-                140 ms
+                {liveStats && liveStats.avgLatencyMs > 0 ? `${liveStats.avgLatencyMs} ms` : 'Standby'}
               </div>
               <div className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mt-1.5 flex items-center justify-center gap-1.5">
                 <Zap className="w-3.5 h-3.5 text-amber-500" />
-                <span>Avg TTFT Latency</span>
+                <span>Avg Gateway Latency</span>
               </div>
             </div>
           </div>

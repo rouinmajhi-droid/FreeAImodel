@@ -44,8 +44,8 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
 
   // Default to canonical FreeAIModel Gateway URL
   const [useLiveUrl] = React.useState(false);
-  const liveOrigin = typeof window !== 'undefined' ? window.location.origin : 'https://freeaimodel.vercel.app';
-  const customDomain = 'https://freeaimodel.vercel.app';
+  const liveOrigin = typeof window !== 'undefined' ? window.location.origin : 'https://freeaimodel.cc.cd';
+  const customDomain = 'https://freeaimodel.cc.cd';
   const baseUrl = useLiveUrl ? liveOrigin : customDomain;
 
   const chatUrl = `${baseUrl}/v1/chat/completions`;

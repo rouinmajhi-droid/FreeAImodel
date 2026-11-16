@@ -13,7 +13,7 @@ export const EndpointsDocs: React.FC<EndpointsDocsProps> = ({ userApiKey, models
   const [activeTab, setActiveTab] = useState<'curl' | 'python' | 'node' | 'langchain'>('curl');
   const [copiedSection, setCopiedSection] = useState<string | null>(null);
 
-  const currentOrigin = typeof window !== 'undefined' ? window.location.origin : 'https://freeaimodel.vercel.app';
+  const currentOrigin = typeof window !== 'undefined' ? window.location.origin : 'https://freeaimodel.cc.cd';
   const chatEndpoint = `${currentOrigin}/v1/chat/completions`;
   const modelsEndpoint = `${currentOrigin}/v1/models`;
   const keyPlaceholder = userApiKey || 'sk-gateway-your_api_key_here';
