@@ -175,7 +175,7 @@ function extractFirebaseToken(req: Request): string | undefined {
  */
 export async function ensureGatewayHydrated(explicitIdToken?: string, force = false): Promise<void> {
   const now = Date.now();
-  if (!force && lastHydratedAt > 0 && now - lastHydratedAt < 15_000) return;
+  if (!force && lastHydratedAt > 0 && now - lastHydratedAt < 3_000) return;
 
   if (hydrationInFlight) {
     await hydrationInFlight;
@@ -1402,6 +1402,34 @@ const handleChatCompletions = async (req: Request, res: Response) => {
         }
       }
     }
+
+    // If requested model wasn't in warm cache (e.g. just added in Admin Panel), force live RTDB refresh immediately
+    if (!modelRecord) {
+      await ensureGatewayHydrated(fbToken, true);
+      availableKeys.length = 0;
+      for (const k of masterProviderKeys) {
+        if (k.status === 'disabled' || k.status === 'exhausted') continue;
+        if (k.status === 'rate_limited') {
+          if (k.cooldownUntil && k.cooldownUntil > now) continue;
+          k.status = 'active';
+          k.cooldownUntil = undefined;
+          k.updatedAt = new Date().toISOString();
+          dirtyProviderKeys.add(k);
+        }
+        if (!isMaskedOrInvalidHeaderKey(k.key)) availableKeys.push(k);
+      }
+      modelRecord = masterModels.get(effectiveModel);
+      if (!modelRecord) {
+        const lowerReq = effectiveModel.toLowerCase();
+        for (const [id, rec] of masterModels.entries()) {
+          if (id.toLowerCase() === lowerReq) {
+            effectiveModel = id;
+            modelRecord = rec;
+            break;
+          }
+        }
+      }
+    }
   }
 
   let candidateKeys =
@@ -2442,12 +2470,12 @@ gatewayApp.post('/api/gateway/sync', (req: Request, res: Response) => {
     rebuildMasterModelsFromPool();
   }
 
-  // Only hydrate live-discovered models from Firestore (must carry ownerKeyId from a real admin key)
+  // Hydrate active models from RTDB sync payload
   if (Array.isArray(models) && masterProviderKeys.length === 0) {
     masterModels.clear();
     if (!replaceProviderKeys) {
       for (const m of models) {
-        if (m && m.id && m.ownerKeyId) {
+        if (m && m.id && m.isActive !== false) {
           masterModels.set(m.id, {
             id: m.id,
             name: m.name || formatModelDisplayName(m.id),

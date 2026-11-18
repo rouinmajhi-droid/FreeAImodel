@@ -1,8 +1,9 @@
 import crypto from 'crypto';
+import { firebaseConfig } from '../shared/firebaseConfig.js';
 
-const DEFAULT_RTDB_URL = 'https://aisdd-6f89e-default-rtdb.firebaseio.com';
-const PROJECT_ID = 'aisdd-6f89e';
-const FIREBASE_WEB_API_KEY = process.env.FIREBASE_WEB_API_KEY || 'AIzaSyBORpX4X_HTiNn_gEruKo6NBX5saZni4d8';
+const DEFAULT_RTDB_URL = firebaseConfig.databaseURL;
+const PROJECT_ID = firebaseConfig.projectId;
+const FIREBASE_WEB_API_KEY = firebaseConfig.apiKey;
 const verifiedIdTokenCache = new Map<string, { uid: string; email?: string; expiresAt: number }>();
 
 interface ServiceAccountCreds {

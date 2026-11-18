@@ -335,7 +335,7 @@ function GatewayApp() {
           const modelsSnap = await get(ref(rtdb, 'models'));
           if (modelsSnap.exists()) {
             loadedModels = rtdbMapToList<GatewayModel>(modelsSnap.val())
-              .filter(m => Boolean(m?.id && m?.ownerKeyId))
+              .filter(m => Boolean(m?.id && m?.isActive !== false))
               .sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
           }
         } catch (err) {
@@ -436,7 +436,7 @@ function GatewayApp() {
       ref(rtdb, 'models'),
       (snapshot) => {
         const liveModels = rtdbMapToList<GatewayModel>(snapshot.val())
-          .filter((m) => Boolean(m?.id && m?.ownerKeyId))
+          .filter((m) => Boolean(m?.id && m?.isActive !== false))
           .sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
         setModels(liveModels);
       },
