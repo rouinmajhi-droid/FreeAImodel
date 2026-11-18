@@ -2,6 +2,8 @@ import crypto from 'crypto';
 
 const DEFAULT_RTDB_URL = 'https://aisdd-6f89e-default-rtdb.firebaseio.com';
 const PROJECT_ID = 'aisdd-6f89e';
+const FIREBASE_WEB_API_KEY = process.env.FIREBASE_WEB_API_KEY || 'AIzaSyBORpX4X_HTiNn_gEruKo6NBX5saZni4d8';
+const verifiedIdTokenCache = new Map<string, { uid: string; email?: string; expiresAt: number }>();
 
 interface ServiceAccountCreds {
   client_email: string;
@@ -240,6 +242,33 @@ export async function upsertItemInRtdb(
   }
 }
 
+export async function patchItemInRtdb(
+  nodeName: string,
+  rawId: string,
+  partialData: Record<string, any>,
+  explicitIdToken?: string
+): Promise<boolean> {
+  const key = toRtdbKey(rawId);
+  try {
+    const url = await buildAuthorizedRtdbUrl(`${nodeName}/${key}`, {}, explicitIdToken);
+    const cleanData = sanitizeForRtdb(partialData);
+    const res = await fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cleanData),
+      signal: AbortSignal.timeout(8000)
+    });
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => '');
+      console.warn(`[RTDB] Failed PATCH /${nodeName}/${key}.json (${res.status}):`, errBody.slice(0, 200));
+    }
+    return res.ok;
+  } catch (err) {
+    console.warn(`[RTDB] Exception PATCH /${nodeName}/${key}.json:`, err);
+    return false;
+  }
+}
+
 export async function patchCollectionInRtdb(
   nodeName: string,
   itemsByRawId: Record<string, Record<string, any>>,
@@ -377,4 +406,43 @@ export function getRtdbBridgeStatus() {
     databaseURL: getRtdbBaseUrl(),
     serverAdminCredentialsAvailable: hasServerAdminCredentials()
   };
+}
+
+export async function verifyFirebaseIdToken(
+  idToken: string
+): Promise<{ uid: string; email?: string } | null> {
+  const token = String(idToken || '').trim();
+  if (!token || token.split('.').length !== 3) return null;
+
+  const cached = verifiedIdTokenCache.get(token);
+  const now = Date.now();
+  if (cached && cached.expiresAt > now) {
+    return { uid: cached.uid, email: cached.email };
+  }
+
+  try {
+    const res = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(FIREBASE_WEB_API_KEY)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idToken: token }),
+        signal: AbortSignal.timeout(5000)
+      }
+    );
+    if (!res.ok) return null;
+    const data: any = await res.json();
+    const user = Array.isArray(data?.users) ? data.users[0] : null;
+    if (!user?.localId) return null;
+
+    const info = { uid: String(user.localId), email: user.email ? String(user.email) : undefined };
+    verifiedIdTokenCache.set(token, { ...info, expiresAt: now + 5 * 60_000 });
+    if (verifiedIdTokenCache.size > 500) {
+      const oldestKey = verifiedIdTokenCache.keys().next().value;
+      if (oldestKey) verifiedIdTokenCache.delete(oldestKey);
+    }
+    return info;
+  } catch {
+    return null;
+  }
 }

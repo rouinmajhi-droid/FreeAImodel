@@ -1005,6 +1005,8 @@ function GatewayApp() {
               apiKeys={apiKeys}
               models={models}
               selectedKey={selectedKeyForPlayground}
+              userUid={currentUser?.uid}
+              getIdToken={getFirebaseIdToken}
             />
           )}
 

@@ -4,12 +4,14 @@ import dotenv from 'dotenv';
 import {
   listCollectionFromRtdb,
   upsertItemInRtdb,
+  patchItemInRtdb,
   patchCollectionInRtdb,
   deleteItemFromRtdb,
   findApiKeyBySecretInRtdb,
   syncModelsInRtdb,
   hasServerAdminCredentials,
-  getRtdbBridgeStatus
+  getRtdbBridgeStatus,
+  verifyFirebaseIdToken
 } from './rtdbStore.js';
 
 dotenv.config();
@@ -22,7 +24,14 @@ export const gatewayApp = express();
 gatewayApp.use((req: Request, res: Response, next: NextFunction) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, DELETE, PATCH');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key, x-user-email, x-firebase-token');
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'Content-Type, Authorization, x-api-key, x-user-email, x-user-uid, x-firebase-token, x-dashboard-client'
+  );
+  res.setHeader(
+    'Access-Control-Expose-Headers',
+    'x-gateway-provider, x-gateway-model, x-gateway-requested-model, x-gateway-fallback, x-gateway-failover-count, x-gateway-key-hint, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, Retry-After'
+  );
   if (req.method === 'OPTIONS') {
     res.status(204).end();
     return;
@@ -162,6 +171,7 @@ function extractFirebaseToken(req: Request): string | undefined {
 
 /**
  * Hydrate in-memory stores directly from Firebase Realtime Database on cold starts or TTL expiry.
+ * Supports normalized fields across admin/external writers and only updates TTL when RTDB responds.
  */
 export async function ensureGatewayHydrated(explicitIdToken?: string, force = false): Promise<void> {
   const now = Date.now();
@@ -175,38 +185,96 @@ export async function ensureGatewayHydrated(explicitIdToken?: string, force = fa
   hydrationInFlight = (async () => {
     try {
       const [dbProviderKeys, dbModels, dbApiKeys, dbLogs, dbUsers] = await Promise.all([
-        listCollectionFromRtdb<StoredProviderKey>('provider_keys', explicitIdToken),
-        listCollectionFromRtdb<StoredModel>('models', explicitIdToken),
-        listCollectionFromRtdb<StoredApiKey>('api_keys', explicitIdToken),
-        listCollectionFromRtdb<StoredRequestLog>('request_logs', explicitIdToken),
-        listCollectionFromRtdb<StoredUserAccount>('user_profiles', explicitIdToken)
+        listCollectionFromRtdb<any>('provider_keys', explicitIdToken),
+        listCollectionFromRtdb<any>('models', explicitIdToken),
+        listCollectionFromRtdb<any>('api_keys', explicitIdToken),
+        listCollectionFromRtdb<any>('request_logs', explicitIdToken),
+        listCollectionFromRtdb<any>('user_profiles', explicitIdToken)
       ]);
 
+      let anyRtdbSuccess = false;
+
       if (Array.isArray(dbProviderKeys)) {
+        anyRtdbSuccess = true;
         const byId = new Map<string, StoredProviderKey>();
         for (const existing of masterProviderKeys) byId.set(existing.id, existing);
         masterProviderKeys.length = 0;
-        for (const pk of dbProviderKeys) {
-          if (pk?.id && pk?.key) {
-            const local = byId.get(pk.id);
-            masterProviderKeys.push(
-              local
-                ? {
-                    ...pk,
-                    supportedModels: pk.supportedModels?.length ? pk.supportedModels : local.supportedModels
-                  }
-                : pk
-            );
-          }
+
+        for (const rawPk of dbProviderKeys) {
+          const rawKeySecret = rawPk?.key || rawPk?.apiKey || rawPk?.secret;
+          if (!rawPk?.id || !rawKeySecret) continue;
+
+          const local = byId.get(rawPk.id);
+          const rawModels = Array.isArray(rawPk.supportedModels)
+            ? rawPk.supportedModels.map((m: any) => String(m).trim()).filter(Boolean)
+            : rawPk.supportedModels && typeof rawPk.supportedModels === 'object'
+            ? Object.keys(rawPk.supportedModels)
+            : [];
+
+          const normalizedStatus: StoredProviderKey['status'] =
+            rawPk.status === 'disabled' ||
+            rawPk.status === 'exhausted' ||
+            rawPk.status === 'rate_limited' ||
+            rawPk.status === 'active'
+              ? rawPk.status
+              : rawPk.isActive === false || rawPk.active === false
+              ? 'disabled'
+              : 'active';
+
+          const normalizedProvider: SupportedProvider = (rawPk.provider ||
+            detectProviderByKey(String(rawKeySecret), rawPk.customBaseUrl)) as SupportedProvider;
+
+          masterProviderKeys.push({
+            id: String(rawPk.id),
+            provider: normalizedProvider,
+            key: String(rawKeySecret).trim(),
+            keyHint:
+              rawPk.keyHint ||
+              (String(rawKeySecret).length > 8
+                ? `${String(rawKeySecret).slice(0, 4)}...${String(rawKeySecret).slice(-4)}`
+                : String(rawKeySecret)),
+            customBaseUrl: normalizeBaseUrl(rawPk.customBaseUrl || rawPk.baseUrl),
+            status: normalizedStatus,
+            supportedModels: rawModels.length ? rawModels : local?.supportedModels || [],
+            requestCount: Number(rawPk.requestCount) || 0,
+            errorCount: Number(rawPk.errorCount) || 0,
+            lastError: rawPk.lastError,
+            cooldownUntil: typeof rawPk.cooldownUntil === 'number' ? rawPk.cooldownUntil : undefined,
+            lastUsedAt: rawPk.lastUsedAt,
+            createdAt: rawPk.createdAt || new Date().toISOString(),
+            updatedAt: rawPk.updatedAt || new Date().toISOString()
+          });
         }
       }
 
       if (Array.isArray(dbModels)) {
+        anyRtdbSuccess = true;
         masterModels.clear();
-        for (const m of dbModels) {
-          if (m?.id && m?.ownerKeyId) {
-            masterModels.set(m.id, m);
-          }
+        for (const rawM of dbModels) {
+          const modelId = String(rawM?.id || rawM?.modelId || '').trim();
+          if (!modelId) continue;
+          if (rawM?.isActive === false || rawM?.active === false) continue;
+
+          const inferredProvider =
+            rawM?.provider ||
+            masterProviderKeys.find((pk) => pk.id === rawM?.ownerKeyId || pk.supportedModels?.includes(modelId))?.provider ||
+            'custom';
+
+          masterModels.set(modelId, {
+            id: modelId,
+            name: String(rawM?.name || formatModelDisplayName(modelId)),
+            provider: String(inferredProvider),
+            ownerKeyId: rawM?.ownerKeyId ? String(rawM.ownerKeyId) : undefined,
+            ownerKeyHint: rawM?.ownerKeyHint ? String(rawM.ownerKeyHint) : undefined,
+            contextWindow: typeof rawM?.contextWindow === 'number' ? rawM.contextWindow : undefined,
+            pricingPrompt: typeof rawM?.pricingPrompt === 'number' ? rawM.pricingPrompt : undefined,
+            pricingCompletion: typeof rawM?.pricingCompletion === 'number' ? rawM.pricingCompletion : undefined,
+            activeKeysCount: typeof rawM?.activeKeysCount === 'number' ? rawM.activeKeysCount : undefined,
+            isActive: true,
+            discoveredAt: rawM?.discoveredAt || new Date().toISOString(),
+            updatedAt: rawM?.updatedAt,
+            description: rawM?.description
+          });
         }
       }
 
@@ -215,21 +283,38 @@ export async function ensureGatewayHydrated(explicitIdToken?: string, force = fa
       }
 
       if (Array.isArray(dbApiKeys)) {
+        anyRtdbSuccess = true;
         masterApiKeys.clear();
-        for (const ak of dbApiKeys) {
-          if (ak?.key) {
-            masterApiKeys.set(ak.key, ak);
-          }
+        for (const rawAk of dbApiKeys) {
+          const keySecret = String(rawAk?.key || rawAk?.apiKey || '').trim();
+          if (!keySecret) continue;
+          masterApiKeys.set(keySecret, {
+            id: String(rawAk.id || `key_${crypto.createHash('sha256').update(keySecret).digest('hex').slice(0, 10)}`),
+            userId: String(rawAk.userId || 'usr_developer'),
+            name: String(rawAk.name || 'API Key'),
+            key: keySecret,
+            keyPrefix: String(
+              rawAk.keyPrefix ||
+                (keySecret.length > 15 ? `${keySecret.slice(0, 11)}...${keySecret.slice(-4)}` : keySecret)
+            ),
+            status: rawAk.status === 'revoked' || rawAk.active === false ? 'revoked' : 'active',
+            totalRequests: Number(rawAk.totalRequests) || 0,
+            totalTokens: Number(rawAk.totalTokens) || 0,
+            createdAt: rawAk.createdAt || new Date().toISOString(),
+            lastUsedAt: rawAk.lastUsedAt
+          });
         }
       }
 
       if (Array.isArray(dbLogs) && dbLogs.length > 0) {
+        anyRtdbSuccess = true;
         const sorted = [...dbLogs].sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));
         masterLogs.length = 0;
         masterLogs.push(...sorted.slice(0, 200));
       }
 
       if (Array.isArray(dbUsers)) {
+        anyRtdbSuccess = true;
         for (const u of dbUsers) {
           if (u?.uid) {
             masterUsers.set(u.uid, u);
@@ -237,7 +322,9 @@ export async function ensureGatewayHydrated(explicitIdToken?: string, force = fa
         }
       }
 
-      lastHydratedAt = Date.now();
+      if (anyRtdbSuccess) {
+        lastHydratedAt = Date.now();
+      }
     } catch (err) {
       console.warn('[FreeAIModel] RTDB hydration error:', err);
     } finally {
@@ -668,15 +755,18 @@ function extractGatewayTokenFromRequest(req: Request): string | null {
   return null;
 }
 
-async function resolveRegisteredGatewayKey(apiKeyToken: string): Promise<StoredApiKey | null> {
+async function resolveRegisteredGatewayKey(
+  apiKeyToken: string,
+  explicitIdToken?: string
+): Promise<StoredApiKey | null> {
   const localMatch = masterApiKeys.get(apiKeyToken);
   if (localMatch) return localMatch;
 
-  await ensureGatewayHydrated(undefined, true);
+  await ensureGatewayHydrated(explicitIdToken, true);
   const afterHydration = masterApiKeys.get(apiKeyToken);
   if (afterHydration) return afterHydration;
 
-  const dbMatch = await findApiKeyBySecretInRtdb<StoredApiKey>(apiKeyToken);
+  const dbMatch = await findApiKeyBySecretInRtdb<StoredApiKey>(apiKeyToken, explicitIdToken);
   if (dbMatch && dbMatch.key) {
     masterApiKeys.set(dbMatch.key, dbMatch);
     return dbMatch;
@@ -686,40 +776,168 @@ async function resolveRegisteredGatewayKey(apiKeyToken: string): Promise<StoredA
 }
 
 // ==========================================
-// Middleware: Strict User Gateway API Key Validation (POST /v1/chat/completions)
+// Per-Key / Per-IP Sliding-Window Rate Limiter (60 RPM API key / 30 RPM dashboard)
+// ==========================================
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const MAX_RPM_PER_API_KEY = Number(process.env.GATEWAY_RPM_LIMIT || 60);
+const MAX_RPM_DASHBOARD_SESSION = Number(process.env.DASHBOARD_RPM_LIMIT || 30);
+const rateLimitBuckets = new Map<string, number[]>();
+
+function checkAndRecordRateLimit(
+  bucketKey: string,
+  limit: number
+): { allowed: boolean; remaining: number; resetEpochSec: number; retryAfterSec: number } {
+  const now = Date.now();
+  const windowStart = now - RATE_LIMIT_WINDOW_MS;
+  const timestamps = (rateLimitBuckets.get(bucketKey) || []).filter((ts) => ts > windowStart);
+
+  if (timestamps.length >= limit) {
+    const oldest = timestamps[0] || now;
+    const retryAfterSec = Math.max(1, Math.ceil((oldest + RATE_LIMIT_WINDOW_MS - now) / 1000));
+    rateLimitBuckets.set(bucketKey, timestamps);
+    return {
+      allowed: false,
+      remaining: 0,
+      resetEpochSec: Math.ceil((oldest + RATE_LIMIT_WINDOW_MS) / 1000),
+      retryAfterSec
+    };
+  }
+
+  timestamps.push(now);
+  rateLimitBuckets.set(bucketKey, timestamps);
+
+  if (rateLimitBuckets.size > 2000) {
+    const firstKey = rateLimitBuckets.keys().next().value;
+    if (firstKey) rateLimitBuckets.delete(firstKey);
+  }
+
+  return {
+    allowed: true,
+    remaining: Math.max(0, limit - timestamps.length),
+    resetEpochSec: Math.ceil((now + RATE_LIMIT_WINDOW_MS) / 1000),
+    retryAfterSec: 0
+  };
+}
+
+function isTrustedDashboardOrigin(req: Request): boolean {
+  const originOrReferer = String(req.headers['origin'] || req.headers['referer'] || '').toLowerCase();
+  if (!originOrReferer) return false;
+  return (
+    originOrReferer.includes('freemodel.cc.cd') ||
+    originOrReferer.includes('freeaimodel.cc.cd') ||
+    originOrReferer.includes('localhost') ||
+    originOrReferer.includes('127.0.0.1') ||
+    originOrReferer.includes('.run.app') ||
+    originOrReferer.includes('.vercel.app')
+  );
+}
+
+// ==========================================
+// Middleware: Unified Custom API Key & Web Dashboard Auth + Rate Limiting (POST /v1/chat/completions)
 // ==========================================
 export async function validateGatewayKey(req: Request, res: Response, next: NextFunction): Promise<void> {
+  const fbToken = extractFirebaseToken(req);
   const apiKeyToken = extractGatewayTokenFromRequest(req);
-  if (!apiKeyToken) {
-    res.status(401).json({
-      error: {
-        message: 'Missing Authorization key. Expected "Authorization: Bearer sk-gateway-..."',
-        type: 'invalid_request_error',
-        code: 'missing_api_key'
-      }
-    });
-    return;
-  }
 
-  if (!apiKeyToken.startsWith('sk-gateway-') || apiKeyToken.length < 16) {
-    res.status(401).json({
-      error: {
-        message: 'Invalid API key format. FreeAIModel keys begin with "sk-gateway-".',
-        type: 'invalid_request_error',
-        code: 'invalid_api_key'
-      }
-    });
-    return;
-  }
+  let matchedKey: StoredApiKey | null = null;
+  let isVirtualDashboardSession = false;
 
-  const matchedKey = await resolveRegisteredGatewayKey(apiKeyToken);
+  if (apiKeyToken) {
+    // Support Firebase ID token JWT passed directly as Bearer token from dashboard clients
+    if (apiKeyToken.split('.').length === 3 && apiKeyToken.length > 80) {
+      const fbUser = await verifyFirebaseIdToken(apiKeyToken);
+      if (fbUser) {
+        await ensureGatewayHydrated(apiKeyToken, masterApiKeys.size === 0);
+        matchedKey =
+          Array.from(masterApiKeys.values()).find((k) => k.userId === fbUser.uid && k.status === 'active') || {
+            id: `dashboard_${fbUser.uid}`,
+            userId: fbUser.uid,
+            name: 'Web Dashboard Session',
+            key: `dashboard_${fbUser.uid}`,
+            keyPrefix: 'dashboard-session',
+            status: 'active',
+            totalRequests: 0,
+            totalTokens: 0,
+            createdAt: new Date().toISOString()
+          };
+        isVirtualDashboardSession = matchedKey.id.startsWith('dashboard_');
+        (req as any).resolvedFirebaseToken = apiKeyToken;
+      }
+    }
+
+    // Standard API Key validation against RTDB `api_keys` (accepts sk-gateway-... or any registered RTDB key)
+    if (!matchedKey) {
+      matchedKey = await resolveRegisteredGatewayKey(apiKeyToken, fbToken);
+      if (!matchedKey) {
+        res.status(401).json({
+          error: {
+            message:
+              'Invalid or unregistered API key. Generate an active key in your Dashboard or verify Authorization: Bearer <key>.',
+            type: 'invalid_request_error',
+            code: 'invalid_api_key'
+          }
+        });
+        return;
+      }
+    }
+  } else if (fbToken) {
+    // Web Dashboard request authenticated via Firebase ID token header (`x-firebase-token`)
+    const fbUser = await verifyFirebaseIdToken(fbToken);
+    if (!fbUser) {
+      res.status(401).json({
+        error: {
+          message: 'Expired or invalid dashboard session token. Please refresh and sign in again.',
+          type: 'invalid_request_error',
+          code: 'invalid_session_token'
+        }
+      });
+      return;
+    }
+    await ensureGatewayHydrated(fbToken, masterApiKeys.size === 0);
+    matchedKey =
+      Array.from(masterApiKeys.values()).find((k) => k.userId === fbUser.uid && k.status === 'active') || {
+        id: `dashboard_${fbUser.uid}`,
+        userId: fbUser.uid,
+        name: 'Web Dashboard Session',
+        key: `dashboard_${fbUser.uid}`,
+        keyPrefix: 'dashboard-session',
+        status: 'active',
+        totalRequests: 0,
+        totalTokens: 0,
+        createdAt: new Date().toISOString()
+      };
+    isVirtualDashboardSession = matchedKey.id.startsWith('dashboard_');
+    (req as any).resolvedFirebaseToken = fbToken;
+  } else if (isTrustedDashboardOrigin(req) && (req.headers['x-dashboard-client'] || req.headers['x-user-uid'])) {
+    // Fallback for signed-in web dashboard user on portal origin when an API key isn't manually entered
+    const rawUid = String(req.headers['x-user-uid'] || '').trim();
+    if (rawUid) {
+      await ensureGatewayHydrated(undefined, masterUsers.size === 0);
+      const userExists = masterUsers.has(rawUid) || Array.from(masterApiKeys.values()).some((k) => k.userId === rawUid);
+      if (userExists) {
+        matchedKey =
+          Array.from(masterApiKeys.values()).find((k) => k.userId === rawUid && k.status === 'active') || {
+            id: `dashboard_${rawUid}`,
+            userId: rawUid,
+            name: 'Web Dashboard Session',
+            key: `dashboard_${rawUid}`,
+            keyPrefix: 'dashboard-session',
+            status: 'active',
+            totalRequests: 0,
+            totalTokens: 0,
+            createdAt: new Date().toISOString()
+          };
+        isVirtualDashboardSession = matchedKey.id.startsWith('dashboard_');
+      }
+    }
+  }
 
   if (!matchedKey) {
     res.status(401).json({
       error: {
-        message: 'Invalid or unregistered FreeAIModel API key. Please generate an active sk-gateway-... key in your Dashboard.',
+        message: 'Missing Authorization key. Expected "Authorization: Bearer sk-gateway-..." or authenticated Web Dashboard session.',
         type: 'invalid_request_error',
-        code: 'invalid_api_key'
+        code: 'missing_api_key'
       }
     });
     return;
@@ -728,7 +946,7 @@ export async function validateGatewayKey(req: Request, res: Response, next: Next
   if (matchedKey.status !== 'active') {
     res.status(403).json({
       error: {
-        message: 'Your FreeAIModel API key has been revoked or suspended.',
+        message: 'Your API key has been revoked or suspended.',
         type: 'permission_denied',
         code: 'key_revoked'
       }
@@ -736,7 +954,43 @@ export async function validateGatewayKey(req: Request, res: Response, next: Next
     return;
   }
 
+  // Sliding-window rate limiting
+  const rpmLimit = isVirtualDashboardSession ? MAX_RPM_DASHBOARD_SESSION : MAX_RPM_PER_API_KEY;
+  const rl = checkAndRecordRateLimit(matchedKey.id, rpmLimit);
+  res.setHeader('X-RateLimit-Limit', String(rpmLimit));
+  res.setHeader('X-RateLimit-Remaining', String(rl.remaining));
+  res.setHeader('X-RateLimit-Reset', String(rl.resetEpochSec));
+
+  if (!rl.allowed) {
+    res.setHeader('Retry-After', String(rl.retryAfterSec));
+    res.status(429).json({
+      error: {
+        message: `Rate limit exceeded (${rpmLimit} requests/minute). Retry after ${rl.retryAfterSec}s.`,
+        type: 'rate_limit_error',
+        code: 'rate_limit_exceeded'
+      }
+    });
+    return;
+  }
+
+  // Daily free credit quota check for registered user profile
+  const userAccount = masterUsers.get(matchedKey.userId);
+  if (userAccount) {
+    ensureDailyCreditsReset(userAccount);
+    if ((userAccount.freeCreditsSpent || 0) >= (userAccount.freeCreditsAllocated || DAILY_FREE_CREDITS)) {
+      res.status(429).json({
+        error: {
+          message: 'Daily free credit limit reached. Credits reset automatically at 00:00 UTC.',
+          type: 'insufficient_quota',
+          code: 'daily_quota_exceeded'
+        }
+      });
+      return;
+    }
+  }
+
   (req as any).gatewayKey = matchedKey;
+  (req as any).isVirtualDashboardSession = isVirtualDashboardSession;
   next();
 }
 
@@ -746,28 +1000,18 @@ export async function validateGatewayKey(req: Request, res: Response, next: Next
 // - If NO API key is supplied, allows public OpenAI-compatible model catalog discovery.
 // ==========================================
 export async function optionalFlexibleGatewayAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
+  const fbToken = extractFirebaseToken(req);
   const apiKeyToken = extractGatewayTokenFromRequest(req);
   if (!apiKeyToken) {
     next();
     return;
   }
 
-  if (!apiKeyToken.startsWith('sk-gateway-') || apiKeyToken.length < 16) {
-    res.status(401).json({
-      error: {
-        message: 'Invalid API key format. FreeAIModel keys begin with "sk-gateway-".',
-        type: 'invalid_request_error',
-        code: 'invalid_api_key'
-      }
-    });
-    return;
-  }
-
-  const matchedKey = await resolveRegisteredGatewayKey(apiKeyToken);
+  const matchedKey = await resolveRegisteredGatewayKey(apiKeyToken, fbToken);
   if (!matchedKey) {
     res.status(401).json({
       error: {
-        message: 'Invalid or unregistered FreeAIModel API key.',
+        message: 'Invalid or unregistered API key.',
         type: 'invalid_request_error',
         code: 'invalid_api_key'
       }
@@ -778,7 +1022,7 @@ export async function optionalFlexibleGatewayAuth(req: Request, res: Response, n
   if (matchedKey.status !== 'active') {
     res.status(403).json({
       error: {
-        message: 'Your FreeAIModel API key has been revoked or suspended.',
+        message: 'Your API key has been revoked or suspended.',
         type: 'permission_denied',
         code: 'key_revoked'
       }
@@ -899,21 +1143,25 @@ gatewayApp.get('/models', optionalFlexibleGatewayAuth, async (req: Request, res:
 // ==========================================
 // Route: POST /v1/chat/completions (OpenAI-compatible Universal Router + Limit-Shift Failover)
 // ==========================================
-const NON_CHAT_MODEL_RE = /realtime|tts|whisper|transcribe|image|dall-e|sora|embedding|moderation|gpt-audio|gpt-live|diarize/i;
+const NON_CHAT_MODEL_RE =
+  /realtime|tts|whisper|transcribe|image|dall-e|sora|embedding|moderation|gpt-audio|gpt-live|diarize|babbage|davinci|chat-latest/i;
+const REASONING_OR_GPT5_RE = /^((gpt-5)|o[134])(-|$)/i;
 const PREFERRED_CHAT_IDS = [
   'gpt-4o-mini',
   'gpt-4o',
   'gpt-4.1-mini',
   'gpt-4.1',
-  'gpt-5-mini',
-  'gpt-5',
   'llama-3.3-70b-versatile',
   'llama-3.1-8b-instant',
   'gemini-2.5-flash',
   'gemini-2.0-flash',
   'deepseek-chat',
-  'mercury'
+  'mercury',
+  'gpt-5-mini',
+  'gpt-5'
 ];
+
+let roundRobinCursor = 0;
 
 function parseRetryAfterMs(retryHeader: string | null): number {
   if (!retryHeader) return 60_000;
@@ -930,18 +1178,86 @@ function parseRetryAfterMs(retryHeader: string | null): number {
 
 function isQuotaExhaustedError(status: number, bodyText: string): boolean {
   if (status === 402) return true;
-  return /insufficient_quota|exceeded your current quota|billing|credit balance|out of credits|payment required/i.test(bodyText);
+  return /insufficient_quota|exceeded your current quota|billing_not_active|credit balance|out of credits|payment required|quota.*exceeded/i.test(
+    bodyText
+  );
+}
+
+function isModelSpecificError(status: number, bodyText: string): boolean {
+  if (status === 404) return true;
+  if (status === 400 && /model|not found|does not exist|unsupported|not a chat model|max_tokens|temperature/i.test(bodyText)) {
+    return true;
+  }
+  return false;
+}
+
+function estimatePromptTokensFromMessages(messages: any[]): number {
+  try {
+    return Math.max(8, Math.ceil(JSON.stringify(messages).length / 4));
+  } catch {
+    return 16;
+  }
+}
+
+function convertAnthropicSseLineToOpenAi(
+  line: string,
+  completionId: string,
+  modelId: string
+): { sseChunk?: string; deltaChars?: number; inputTokens?: number; outputTokens?: number } {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith('data:')) return {};
+  const payloadStr = trimmed.slice(5).trim();
+  if (!payloadStr || payloadStr === '[DONE]') return {};
+
+  try {
+    const evt = JSON.parse(payloadStr);
+    if (evt?.type === 'message_start' && evt?.message?.usage?.input_tokens) {
+      return { inputTokens: Number(evt.message.usage.input_tokens) || undefined };
+    }
+    if (evt?.type === 'content_block_delta' && evt?.delta?.text) {
+      const textChunk = String(evt.delta.text);
+      const openAiFrame = {
+        id: completionId,
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model: modelId,
+        choices: [{ index: 0, delta: { content: textChunk }, finish_reason: null }]
+      };
+      return {
+        sseChunk: `data: ${JSON.stringify(openAiFrame)}\n\n`,
+        deltaChars: textChunk.length
+      };
+    }
+    if (evt?.type === 'message_delta') {
+      const outputTokens = evt?.usage?.output_tokens ? Number(evt.usage.output_tokens) : undefined;
+      const openAiFrame = {
+        id: completionId,
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model: modelId,
+        choices: [{ index: 0, delta: {}, finish_reason: evt?.delta?.stop_reason === 'end_turn' ? 'stop' : 'stop' }]
+      };
+      return { sseChunk: `data: ${JSON.stringify(openAiFrame)}\n\n`, outputTokens };
+    }
+  } catch {
+    // Ignore non-JSON ping frames
+  }
+  return {};
 }
 
 const handleChatCompletions = async (req: Request, res: Response) => {
   const startTime = Date.now();
   const apiKeyRecord: StoredApiKey = (req as any).gatewayKey;
+  const isVirtualDashboardSession = Boolean((req as any).isVirtualDashboardSession);
+  const fbToken = (req as any).resolvedFirebaseToken || extractFirebaseToken(req);
+
   const {
     model,
     messages,
     stream,
     temperature,
     max_tokens,
+    max_completion_tokens,
     top_p,
     stop,
     presence_penalty,
@@ -950,17 +1266,6 @@ const handleChatCompletions = async (req: Request, res: Response) => {
     tool_choice,
     response_format
   } = req.body || {};
-
-  if (!model) {
-    res.status(400).json({
-      error: {
-        message: 'Missing "model" parameter in chat completion payload.',
-        type: 'invalid_request_error',
-        code: 'model_missing'
-      }
-    });
-    return;
-  }
 
   if (!messages || !Array.isArray(messages) || messages.length === 0) {
     res.status(400).json({
@@ -973,13 +1278,16 @@ const handleChatCompletions = async (req: Request, res: Response) => {
     return;
   }
 
-  await ensureGatewayHydrated(undefined, masterProviderKeys.length === 0);
+  await ensureGatewayHydrated(fbToken, masterProviderKeys.length === 0 || masterModels.size === 0);
+  if (masterModels.size === 0 && masterProviderKeys.length > 0) {
+    await ensureLiveModelsDiscoveredFromPool(fbToken);
+  }
 
   const now = Date.now();
   const dirtyProviderKeys = new Set<StoredProviderKey>();
 
   // Recover expired 429 cooldowns and build healthy active key pool
-  const availableKeys = masterProviderKeys.filter(k => {
+  const availableKeys = masterProviderKeys.filter((k) => {
     if (k.status === 'disabled' || k.status === 'exhausted') return false;
     if (k.status === 'rate_limited') {
       if (k.cooldownUntil && k.cooldownUntil > now) return false;
@@ -992,35 +1300,23 @@ const handleChatCompletions = async (req: Request, res: Response) => {
     return true;
   });
 
-  // Resolve requested model: exact -> case-insensitive -> fallback to best chat-capable active synced model
-  let effectiveModel = String(model).trim();
-  let usedFallbackModel = false;
-
-  let modelRecord = masterModels.get(effectiveModel);
-  if (!modelRecord) {
-    const lowerReq = effectiveModel.toLowerCase();
-    for (const [id, rec] of masterModels.entries()) {
-      if (id.toLowerCase() === lowerReq) {
-        effectiveModel = id;
-        modelRecord = rec;
-        break;
-      }
-    }
-  }
+  const requestedModelRaw = typeof model === 'string' && model.trim() ? model.trim() : 'auto';
 
   const findKeysForModel = (targetModelId: string, targetRecord?: StoredModel, keyPool = availableKeys) => {
     const targetProvider = targetRecord?.provider;
-    const keys = keyPool.filter(k => {
-      const ownsModel = (Array.isArray(k.supportedModels) && k.supportedModels.includes(targetModelId)) ||
+    const keys = keyPool.filter((k) => {
+      const ownsModel =
+        (Array.isArray(k.supportedModels) && k.supportedModels.includes(targetModelId)) ||
         (targetRecord?.ownerKeyId && k.id === targetRecord.ownerKeyId);
       const sameProvider = Boolean(targetProvider && k.provider === targetProvider);
       return ownsModel || sameProvider;
     });
 
-    // Fair Load-Balanced Rotation: model owner -> fewest errors -> oldest lastUsedAt / fewest requests
+    // Load-balanced sorting: model owner -> fewest errors -> round-robin + least recently used
+    const cursor = roundRobinCursor++ % Math.max(1, keys.length);
     keys.sort((a, b) => {
-      const aOwns = (a.supportedModels?.includes(targetModelId) || a.id === targetRecord?.ownerKeyId) ? 1 : 0;
-      const bOwns = (b.supportedModels?.includes(targetModelId) || b.id === targetRecord?.ownerKeyId) ? 1 : 0;
+      const aOwns = a.supportedModels?.includes(targetModelId) || a.id === targetRecord?.ownerKeyId ? 1 : 0;
+      const bOwns = b.supportedModels?.includes(targetModelId) || b.id === targetRecord?.ownerKeyId ? 1 : 0;
       if (aOwns !== bOwns) return bOwns - aOwns;
 
       const errDiff = (a.errorCount || 0) - (b.errorCount || 0);
@@ -1032,28 +1328,36 @@ const handleChatCompletions = async (req: Request, res: Response) => {
 
       return (a.requestCount || 0) - (b.requestCount || 0);
     });
+
+    // Apply round-robin rotation across tied lowest-error keys so traffic distributes evenly
+    if (keys.length > 1 && cursor > 0 && (keys[0].errorCount || 0) === (keys[cursor].errorCount || 0)) {
+      const rotated = [...keys.slice(cursor), ...keys.slice(0, cursor)];
+      return rotated;
+    }
     return keys;
   };
 
-  const pickChatModelForPool = (keyPool: StoredProviderKey[]): { id: string; record: StoredModel } | undefined => {
-    const poolIds = new Set(keyPool.map(k => k.id));
-    const routableEntries: Array<{ id: string; record: StoredModel }> = [];
+  const buildRoutableCatalogEntries = (keyPool: StoredProviderKey[]): Array<{ id: string; record: StoredModel }> => {
+    const entries: Array<{ id: string; record: StoredModel }> = [];
+    const seen = new Set<string>();
 
     for (const m of masterModels.values()) {
       if (findKeysForModel(m.id, m, keyPool).length > 0) {
-        routableEntries.push({ id: m.id, record: m });
+        entries.push({ id: m.id, record: m });
+        seen.add(m.id);
       }
     }
 
-    if (routableEntries.length === 0) {
-      for (const k of keyPool) {
-        if (!poolIds.has(k.id) || !Array.isArray(k.supportedModels)) continue;
-        for (const rawId of k.supportedModels) {
-          const id = String(rawId).trim();
-          if (!id) continue;
-          routableEntries.push({
-            id,
-            record: masterModels.get(id) || {
+    for (const k of keyPool) {
+      if (!Array.isArray(k.supportedModels)) continue;
+      for (const rawId of k.supportedModels) {
+        const id = String(rawId).trim();
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        entries.push({
+          id,
+          record:
+            masterModels.get(id) || {
               id,
               name: formatModelDisplayName(id),
               provider: k.provider,
@@ -1061,25 +1365,57 @@ const handleChatCompletions = async (req: Request, res: Response) => {
               ownerKeyHint: k.keyHint,
               discoveredAt: new Date().toISOString()
             }
-          });
+        });
+      }
+    }
+    return entries;
+  };
+
+  const pickChatModelForPool = (
+    keyPool: StoredProviderKey[],
+    excludedModels = new Set<string>()
+  ): { id: string; record: StoredModel } | undefined => {
+    const routableEntries = buildRoutableCatalogEntries(keyPool).filter((e) => !excludedModels.has(e.id));
+    if (routableEntries.length === 0) return undefined;
+
+    for (const preferredId of PREFERRED_CHAT_IDS) {
+      const match = routableEntries.find((entry) => entry.id.toLowerCase() === preferredId);
+      if (match) return match;
+    }
+    return routableEntries.find((entry) => !NON_CHAT_MODEL_RE.test(entry.id)) || routableEntries[0];
+  };
+
+  // Resolve requested model (handle 'auto'/'default', exact match, case-insensitive, or fallback)
+  let effectiveModel = requestedModelRaw;
+  let usedFallbackModel = false;
+  let modelRecord: StoredModel | undefined;
+
+  if (requestedModelRaw.toLowerCase() !== 'auto' && requestedModelRaw.toLowerCase() !== 'default') {
+    modelRecord = masterModels.get(effectiveModel);
+    if (!modelRecord) {
+      const lowerReq = effectiveModel.toLowerCase();
+      for (const [id, rec] of masterModels.entries()) {
+        if (id.toLowerCase() === lowerReq) {
+          effectiveModel = id;
+          modelRecord = rec;
+          break;
         }
       }
     }
+  }
 
-    for (const preferredId of PREFERRED_CHAT_IDS) {
-      const match = routableEntries.find(entry => entry.id.toLowerCase() === preferredId);
-      if (match) return match;
-    }
-    return routableEntries.find(entry => !NON_CHAT_MODEL_RE.test(entry.id)) || routableEntries[0];
-  };
+  let candidateKeys =
+    requestedModelRaw.toLowerCase() === 'auto' || requestedModelRaw.toLowerCase() === 'default'
+      ? []
+      : findKeysForModel(effectiveModel, modelRecord);
 
-  let candidateKeys = findKeysForModel(effectiveModel, modelRecord);
-
-  // Automatic Fallback Model Routing if requested model isn't matched by any active key
+  // If requested model isn't matched or caller passed 'auto', pick best chat-capable active model
   if (candidateKeys.length === 0 && availableKeys.length > 0) {
     const picked = pickChatModelForPool(availableKeys);
     if (picked) {
-      usedFallbackModel = true;
+      if (requestedModelRaw.toLowerCase() !== 'auto' && requestedModelRaw.toLowerCase() !== 'default') {
+        usedFallbackModel = true;
+      }
       effectiveModel = picked.id;
       modelRecord = picked.record;
       candidateKeys = findKeysForModel(effectiveModel, modelRecord);
@@ -1093,16 +1429,78 @@ const handleChatCompletions = async (req: Request, res: Response) => {
   let lastErrorMsg = '';
   let lastErrorStatus = 502;
   let providerUsed = '';
-  const promptTokens = Math.max(12, Math.round(JSON.stringify(messages).length / 4));
+  let promptTokens = estimatePromptTokensFromMessages(messages);
   let completionTokens = 0;
+  let totalTokensOverride: number | undefined;
+  let pendingResponseAction: (() => void) | null = null;
 
-  const triedKeyIds = new Set<string>();
+  const triedPairs = new Set<string>();
+  const triedModels = new Set<string>();
+
+  const buildUpstreamPayload = (providerKey: StoredProviderKey, modelToUse: string, omitOptionalParams = false) => {
+    const isAnthropic = providerKey.provider === 'anthropic';
+    if (isAnthropic) {
+      const sysMsgs = messages
+        .filter((m: any) => m.role === 'system')
+        .map((m: any) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)))
+        .join('\n');
+      const nonSysMsgs = messages
+        .filter((m: any) => m.role !== 'system')
+        .map((m: any) => ({
+          role: m.role === 'assistant' ? 'assistant' : 'user',
+          content: m.content
+        }));
+      const payload: any = {
+        model: modelToUse,
+        messages: nonSysMsgs.length > 0 ? nonSysMsgs : [{ role: 'user', content: sysMsgs || 'Hello' }],
+        max_tokens: max_completion_tokens ?? max_tokens ?? 2048,
+        stream: Boolean(stream)
+      };
+      if (!omitOptionalParams && temperature !== undefined) payload.temperature = temperature;
+      if (sysMsgs && nonSysMsgs.length > 0) payload.system = sysMsgs;
+      return payload;
+    }
+
+    const isReasoningOrGpt5 = providerKey.provider === 'openai' && REASONING_OR_GPT5_RE.test(modelToUse);
+    const payload: any = {
+      model: modelToUse,
+      messages,
+      stream: Boolean(stream)
+    };
+
+    if (!omitOptionalParams) {
+      if (isReasoningOrGpt5) {
+        const cap = max_completion_tokens ?? max_tokens;
+        if (cap !== undefined) payload.max_completion_tokens = cap;
+      } else {
+        if (temperature !== undefined) payload.temperature = temperature;
+        if (max_tokens !== undefined) payload.max_tokens = max_tokens;
+        if (max_completion_tokens !== undefined) payload.max_completion_tokens = max_completion_tokens;
+        if (top_p !== undefined) payload.top_p = top_p;
+      }
+      if (stop !== undefined) payload.stop = stop;
+      if (presence_penalty !== undefined && !isReasoningOrGpt5) payload.presence_penalty = presence_penalty;
+      if (frequency_penalty !== undefined && !isReasoningOrGpt5) payload.frequency_penalty = frequency_penalty;
+      if (tools !== undefined) payload.tools = tools;
+      if (tool_choice !== undefined) payload.tool_choice = tool_choice;
+      if (response_format !== undefined) payload.response_format = response_format;
+      if (stream && (providerKey.provider === 'openai' || providerKey.provider === 'groq')) {
+        payload.stream_options = { include_usage: true };
+      }
+    }
+
+    return payload;
+  };
 
   const executeUpstreamAttempt = async (providerKey: StoredProviderKey, modelToUse: string): Promise<boolean> => {
-    triedKeyIds.add(providerKey.id);
+    const pairId = `${providerKey.id}::${modelToUse}`;
+    if (triedPairs.has(pairId)) return false;
+    triedPairs.add(pairId);
+    triedModels.add(modelToUse);
+
     const baseUrl = resolveProviderBaseUrl(providerKey.provider, providerKey.customBaseUrl);
     const isAnthropic = providerKey.provider === 'anthropic';
-    const chatPath = isAnthropic ? '/messages' : (PROVIDER_CONFIGS[providerKey.provider]?.chatPath || '/chat/completions');
+    const chatPath = isAnthropic ? '/messages' : PROVIDER_CONFIGS[providerKey.provider]?.chatPath || '/chat/completions';
     const endpoint = `${baseUrl}${chatPath}`;
 
     try {
@@ -1111,67 +1509,79 @@ const handleChatCompletions = async (req: Request, res: Response) => {
       providerKey.updatedAt = new Date().toISOString();
       dirtyProviderKeys.add(providerKey);
 
-      let headers: Record<string, string>;
-      let upstreamPayload: any;
+      const headers: Record<string, string> = isAnthropic
+        ? {
+            'Content-Type': 'application/json',
+            'x-api-key': providerKey.key,
+            'anthropic-version': '2023-06-01',
+            'User-Agent': 'FreeAIModel-Gateway/1.0'
+          }
+        : {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${providerKey.key}`,
+            'User-Agent': 'FreeAIModel-Gateway/1.0',
+            ...(providerKey.provider === 'openrouter'
+              ? { 'HTTP-Referer': 'https://freeaimodel.cc.cd', 'X-Title': 'FreeAIModel Gateway' }
+              : {})
+          };
 
-      if (isAnthropic) {
-        headers = {
-          'Content-Type': 'application/json',
-          'x-api-key': providerKey.key,
-          'anthropic-version': '2023-06-01',
-          'User-Agent': 'FreeAIModel-Gateway/1.0'
-        };
-        const sysMsgs = messages.filter((m: any) => m.role === 'system').map((m: any) => m.content).join('\n');
-        const nonSysMsgs = messages.filter((m: any) => m.role !== 'system').map((m: any) => ({
-          role: m.role === 'assistant' ? 'assistant' : 'user',
-          content: m.content
-        }));
-        upstreamPayload = {
-          model: modelToUse,
-          messages: nonSysMsgs,
-          max_tokens: max_tokens ?? 2048,
-          temperature: temperature ?? 0.7,
-          stream: Boolean(stream)
-        };
-        if (sysMsgs) upstreamPayload.system = sysMsgs;
-      } else {
-        headers = {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${providerKey.key}`,
-          'User-Agent': 'FreeAIModel-Gateway/1.0'
-        };
-        upstreamPayload = {
-          model: modelToUse,
-          messages,
-          stream: Boolean(stream)
-        };
-        if (temperature !== undefined) upstreamPayload.temperature = temperature;
-        if (max_tokens !== undefined) upstreamPayload.max_tokens = max_tokens;
-        if (top_p !== undefined) upstreamPayload.top_p = top_p;
-        if (stop !== undefined) upstreamPayload.stop = stop;
-        if (presence_penalty !== undefined) upstreamPayload.presence_penalty = presence_penalty;
-        if (frequency_penalty !== undefined) upstreamPayload.frequency_penalty = frequency_penalty;
-        if (tools !== undefined) upstreamPayload.tools = tools;
-        if (tool_choice !== undefined) upstreamPayload.tool_choice = tool_choice;
-        if (response_format !== undefined) upstreamPayload.response_format = response_format;
-      }
-
-      const upstreamResponse = await fetch(endpoint, {
+      let upstreamPayload = buildUpstreamPayload(providerKey, modelToUse, false);
+      let upstreamResponse = await fetch(endpoint, {
         method: 'POST',
         headers,
         body: JSON.stringify(upstreamPayload),
         signal: AbortSignal.timeout(45000)
       });
 
+      // Retry once cleanly with stripped optional params if upstream returned 400 specifically for unsupported parameter
+      if (upstreamResponse.status === 400) {
+        const previewErr = await upstreamResponse.text().catch(() => '');
+        if (/unsupported parameter|unsupported value|stream_options|max_tokens|temperature|top_p/i.test(previewErr)) {
+          upstreamPayload = buildUpstreamPayload(providerKey, modelToUse, true);
+          upstreamResponse = await fetch(endpoint, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(upstreamPayload),
+            signal: AbortSignal.timeout(45000)
+          });
+        } else {
+          // Restore error handling cleanly with already-read previewErr
+          failoverCount++;
+          lastErrorStatus = 400;
+          lastErrorMsg = previewErr || 'Bad request';
+          providerKey.errorCount = (providerKey.errorCount || 0) + 1;
+          providerKey.lastError = `HTTP 400 (${modelToUse}): ${previewErr.slice(0, 150)}`;
+          return false;
+        }
+      }
+
       if (upstreamResponse.status === 429) {
         failoverCount++;
         lastErrorStatus = 429;
-        lastErrorMsg = await upstreamResponse.text().catch(() => 'Rate limit exceeded');
-        const cooldownMs = parseRetryAfterMs(upstreamResponse.headers.get('retry-after'));
-        providerKey.status = 'rate_limited';
+        const errBody = await upstreamResponse.text().catch(() => 'Rate limit exceeded');
+        lastErrorMsg = errBody;
         providerKey.errorCount = (providerKey.errorCount || 0) + 1;
-        providerKey.lastError = `Rate limit 429 hit at ${new Date().toLocaleTimeString()} (rotating to backup key)`;
-        providerKey.cooldownUntil = Date.now() + cooldownMs;
+
+        if (isQuotaExhaustedError(429, errBody)) {
+          providerKey.status = 'exhausted';
+          providerKey.lastError = `Quota exhausted (429): ${errBody.slice(0, 140)}`;
+        } else {
+          const cooldownMs = parseRetryAfterMs(upstreamResponse.headers.get('retry-after'));
+          providerKey.status = 'rate_limited';
+          providerKey.cooldownUntil = Date.now() + cooldownMs;
+          providerKey.lastError = `Rate limit 429 hit at ${new Date().toLocaleTimeString()} (auto-rotated)`;
+        }
+        return false;
+      }
+
+      if (upstreamResponse.status === 401 || upstreamResponse.status === 403) {
+        failoverCount++;
+        lastErrorStatus = upstreamResponse.status;
+        const errBody = await upstreamResponse.text().catch(() => 'Unauthorized key');
+        lastErrorMsg = errBody;
+        providerKey.status = 'disabled';
+        providerKey.errorCount = (providerKey.errorCount || 0) + 1;
+        providerKey.lastError = `Auth error (${upstreamResponse.status}): ${errBody.slice(0, 140)}`;
         return false;
       }
 
@@ -1185,95 +1595,164 @@ const handleChatCompletions = async (req: Request, res: Response) => {
         if (isQuotaExhaustedError(upstreamResponse.status, errorBody)) {
           providerKey.status = 'exhausted';
           providerKey.lastError = `Quota exhausted (${upstreamResponse.status}): ${errorBody.slice(0, 140)}`;
+        } else if (isModelSpecificError(upstreamResponse.status, errorBody)) {
+          // Model unavailable on this key — keep key active so it can handle fallback models
+          providerKey.lastError = `Model ${modelToUse} rejected (${upstreamResponse.status}): ${errorBody.slice(0, 120)}`;
         } else {
           providerKey.lastError = `HTTP ${upstreamResponse.status}: ${errorBody.slice(0, 150)}`;
         }
         return false;
       }
 
-      if (stream) {
-        res.setHeader('Content-Type', 'text/event-stream');
-        res.setHeader('Cache-Control', 'no-cache');
+      if (stream && upstreamResponse.body) {
+        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache, no-transform');
         res.setHeader('Connection', 'keep-alive');
         res.setHeader('x-gateway-provider', providerKey.provider);
         res.setHeader('x-gateway-model', modelToUse);
+        res.setHeader('x-gateway-requested-model', requestedModelRaw);
         res.setHeader('x-gateway-fallback', usedFallbackModel ? 'true' : 'false');
         res.setHeader('x-gateway-failover-count', String(failoverCount));
         res.setHeader('x-gateway-key-hint', providerKey.keyHint);
+        res.flushHeaders?.();
 
-        if (upstreamResponse.body) {
-          const reader = upstreamResponse.body.getReader();
-          const decoder = new TextDecoder();
-          let streamedChars = 0;
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            const chunk = decoder.decode(value, { stream: true });
-            streamedChars += chunk.length;
+        const reader = upstreamResponse.body.getReader();
+        const decoder = new TextDecoder();
+        const streamId = 'chatcmpl-' + Math.random().toString(36).substring(2, 10);
+        let sseBuffer = '';
+        let streamedChars = 0;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = decoder.decode(value, { stream: true });
+
+          if (isAnthropic) {
+            sseBuffer += chunk;
+            const lines = sseBuffer.split('\n');
+            sseBuffer = lines.pop() || '';
+            for (const line of lines) {
+              const converted = convertAnthropicSseLineToOpenAi(line, streamId, modelToUse);
+              if (converted.inputTokens) promptTokens = converted.inputTokens;
+              if (converted.outputTokens) completionTokens = converted.outputTokens;
+              if (converted.deltaChars) streamedChars += converted.deltaChars;
+              if (converted.sseChunk) res.write(converted.sseChunk);
+            }
+          } else {
             res.write(chunk);
+            streamedChars += chunk.length;
+            // Sniff usage frame if provider emits stream_options usage
+            for (const line of chunk.split('\n')) {
+              const trimmed = line.trim();
+              if (!trimmed.startsWith('data:') || trimmed === 'data: [DONE]') continue;
+              try {
+                const parsed = JSON.parse(trimmed.slice(5).trim());
+                if (parsed?.usage) {
+                  if (typeof parsed.usage.prompt_tokens === 'number') promptTokens = parsed.usage.prompt_tokens;
+                  if (typeof parsed.usage.completion_tokens === 'number') {
+                    completionTokens = parsed.usage.completion_tokens;
+                  }
+                  if (typeof parsed.usage.total_tokens === 'number') totalTokensOverride = parsed.usage.total_tokens;
+                }
+              } catch {
+                // Ignore partial SSE JSON lines split across chunks
+              }
+            }
           }
-          res.end();
-          completionTokens = Math.max(15, Math.round(streamedChars / 16));
-          providerUsed = providerKey.provider;
-          providerKey.status = 'active';
-          providerKey.cooldownUntil = undefined;
-          effectiveModel = modelToUse;
-          return true;
         }
+
+        const remaining = decoder.decode();
+        if (remaining) {
+          if (isAnthropic) {
+            for (const line of (sseBuffer + remaining).split('\n')) {
+              const converted = convertAnthropicSseLineToOpenAi(line, streamId, modelToUse);
+              if (converted.sseChunk) res.write(converted.sseChunk);
+            }
+            res.write('data: [DONE]\n\n');
+          } else {
+            res.write(remaining);
+            streamedChars += remaining.length;
+          }
+        } else if (isAnthropic) {
+          res.write('data: [DONE]\n\n');
+        }
+
+        if (completionTokens === 0) {
+          completionTokens = Math.max(8, Math.round(streamedChars / (isAnthropic ? 4 : 16)));
+        }
+        providerUsed = providerKey.provider;
+        providerKey.status = 'active';
+        providerKey.cooldownUntil = undefined;
+        providerKey.lastError = undefined;
+        effectiveModel = modelToUse;
+        pendingResponseAction = () => {
+          if (!res.writableEnded) res.end();
+        };
+        return true;
       }
 
       let data: any = await upstreamResponse.json();
       providerUsed = providerKey.provider;
       providerKey.status = 'active';
       providerKey.cooldownUntil = undefined;
+      providerKey.lastError = undefined;
       effectiveModel = modelToUse;
 
       if (isAnthropic && data.content) {
-        const text = Array.isArray(data.content)
-          ? data.content.map((c: any) => c.text || '').join('')
-          : '';
+        const text = Array.isArray(data.content) ? data.content.map((c: any) => c.text || '').join('') : '';
+        const pTok = Number(data.usage?.input_tokens) || promptTokens;
+        const cTok = Number(data.usage?.output_tokens) || Math.max(10, Math.round(text.length / 4));
         data = {
           id: data.id || 'chatcmpl-' + Math.random().toString(36).substring(2, 10),
           object: 'chat.completion',
           created: Math.floor(Date.now() / 1000),
           model: modelToUse,
-          choices: [{
-            index: 0,
-            message: { role: 'assistant', content: text },
-            finish_reason: data.stop_reason === 'end_turn' ? 'stop' : (data.stop_reason || 'stop')
-          }],
+          choices: [
+            {
+              index: 0,
+              message: { role: 'assistant', content: text },
+              finish_reason: data.stop_reason === 'end_turn' ? 'stop' : data.stop_reason || 'stop'
+            }
+          ],
           usage: {
-            prompt_tokens: data.usage?.input_tokens || promptTokens,
-            completion_tokens: data.usage?.output_tokens || Math.max(15, Math.round(text.length / 4)),
-            total_tokens: (data.usage?.input_tokens || promptTokens) + (data.usage?.output_tokens || 0)
+            prompt_tokens: pTok,
+            completion_tokens: cTok,
+            total_tokens: pTok + cTok
           }
         };
       }
 
       if (data.usage) {
-        completionTokens = data.usage.completion_tokens || completionTokens;
+        if (typeof data.usage.prompt_tokens === 'number') promptTokens = data.usage.prompt_tokens;
+        if (typeof data.usage.completion_tokens === 'number') completionTokens = data.usage.completion_tokens;
+        if (typeof data.usage.total_tokens === 'number') totalTokensOverride = data.usage.total_tokens;
       } else {
         const content = data.choices?.[0]?.message?.content || '';
-        completionTokens = Math.max(15, Math.round(content.length / 4));
+        completionTokens = Math.max(8, Math.round(content.length / 4));
       }
 
+      const finalTotalTok = totalTokensOverride ?? promptTokens + completionTokens;
       data.gateway_meta = {
         provider_used: providerKey.provider,
-        requested_model: model,
+        requested_model: requestedModelRaw,
         routed_model: modelToUse,
         fallback_routed: usedFallbackModel,
         failover_count: failoverCount,
         key_hint: providerKey.keyHint,
         latency_ms: Date.now() - startTime,
-        cost_usd: (promptTokens * 0.000002) + (completionTokens * 0.000006)
+        cost_usd: promptTokens * 0.000002 + completionTokens * 0.000006,
+        total_tokens: finalTotalTok
       };
 
-      res.setHeader('x-gateway-provider', providerKey.provider);
-      res.setHeader('x-gateway-model', modelToUse);
-      res.setHeader('x-gateway-fallback', usedFallbackModel ? 'true' : 'false');
-      res.setHeader('x-gateway-failover-count', String(failoverCount));
-      res.setHeader('x-gateway-key-hint', providerKey.keyHint);
-      res.json(data);
+      pendingResponseAction = () => {
+        res.setHeader('x-gateway-provider', providerKey.provider);
+        res.setHeader('x-gateway-model', modelToUse);
+        res.setHeader('x-gateway-requested-model', requestedModelRaw);
+        res.setHeader('x-gateway-fallback', usedFallbackModel ? 'true' : 'false');
+        res.setHeader('x-gateway-failover-count', String(failoverCount));
+        res.setHeader('x-gateway-key-hint', providerKey.keyHint);
+        res.json(data);
+      };
       return true;
     } catch (err: any) {
       failoverCount++;
@@ -1284,7 +1763,7 @@ const handleChatCompletions = async (req: Request, res: Response) => {
     }
   };
 
-  // Stage 1: Try all active keys supporting the primary/requested model (auto-rotating on 429/error)
+  // Stage 1: Try all load-balanced active keys matching the requested model / provider
   for (const providerKey of candidateKeys) {
     if (await executeUpstreamAttempt(providerKey, effectiveModel)) {
       success = true;
@@ -1292,98 +1771,158 @@ const handleChatCompletions = async (req: Request, res: Response) => {
     }
   }
 
-  // Stage 2: Cross-Pool Limit-Shift Failover if all primary keys failed and other active keys remain
-  if (!success) {
-    const remainingPoolKeys = availableKeys.filter(k => !triedKeyIds.has(k.id));
-    if (remainingPoolKeys.length > 0) {
-      const backupPick = pickChatModelForPool(remainingPoolKeys);
-      const backupModel = backupPick?.id || effectiveModel;
-      const backupKeys = backupPick
-        ? findKeysForModel(backupModel, backupPick.record, remainingPoolKeys)
-        : remainingPoolKeys;
+  // Stage 2: Smart Multi-Tier Fallback (Tier 2A: Other Healthy Providers -> Tier 2B: Healthy Alternate Chat Models)
+  if (!success && availableKeys.length > 0) {
+    const primaryProvidersTried = new Set(candidateKeys.map((k) => k.provider));
+    const healthyPool = masterProviderKeys.filter(
+      (k) => k.status === 'active' && !isMaskedOrInvalidHeaderKey(k.key)
+    );
+
+    // Tier 2A: Try healthy keys from DIFFERENT providers first (cross-provider failover)
+    const otherProviderKeys = healthyPool.filter((k) => !primaryProvidersTried.has(k.provider));
+    // Tier 2B: Try remaining active keys with an alternate proven chat model (cross-model fallback)
+    const sameProviderRemainingKeys = healthyPool.filter((k) => primaryProvidersTried.has(k.provider));
+
+    const orderedFallbackKeys = [...otherProviderKeys, ...sameProviderRemainingKeys];
+    let fallbackAttempts = 0;
+    const MAX_FALLBACK_ATTEMPTS = 8;
+
+    for (const backupKey of orderedFallbackKeys) {
+      if (fallbackAttempts >= MAX_FALLBACK_ATTEMPTS) break;
+
+      const pickedForKey = pickChatModelForPool([backupKey], triedModels);
+      const fallbackModel =
+        pickedForKey?.id ||
+        backupKey.supportedModels?.find((id) => !NON_CHAT_MODEL_RE.test(id) && !triedModels.has(id)) ||
+        backupKey.supportedModels?.find((id) => !NON_CHAT_MODEL_RE.test(id)) ||
+        effectiveModel;
+
+      if (triedPairs.has(`${backupKey.id}::${fallbackModel}`)) continue;
 
       usedFallbackModel = true;
-      for (const backupKey of backupKeys) {
-        const modelForKey = backupKey.supportedModels?.length
-          ? (backupKey.supportedModels.includes(backupModel)
-              ? backupModel
-              : backupKey.supportedModels.find(id => !NON_CHAT_MODEL_RE.test(id)) || backupKey.supportedModels[0])
-          : backupModel;
-        if (await executeUpstreamAttempt(backupKey, modelForKey)) {
-          success = true;
-          break;
-        }
+      fallbackAttempts++;
+      if (await executeUpstreamAttempt(backupKey, fallbackModel)) {
+        success = true;
+        break;
       }
     }
   }
 
-  // Persist rotated/rate-limited/exhausted provider key telemetry to Firebase RTDB
+  const totalTokens = totalTokensOverride ?? promptTokens + completionTokens;
+  const cost = promptTokens * 0.000002 + completionTokens * 0.000006;
+
+  // Build RTDB persistence promises and await cleanly (with bounded timeout) before closing response
+  const dbOps: Array<Promise<any>> = [];
+
   if (dirtyProviderKeys.size > 0) {
     const dirtyPatch: Record<string, StoredProviderKey> = {};
     for (const pk of dirtyProviderKeys) dirtyPatch[pk.id] = pk;
-    patchCollectionInRtdb('provider_keys', dirtyPatch).catch(() => {});
+    dbOps.push(patchCollectionInRtdb('provider_keys', dirtyPatch, fbToken).catch(() => false));
+  }
+
+  if (success) {
+    apiKeyRecord.totalRequests = (apiKeyRecord.totalRequests || 0) + 1;
+    apiKeyRecord.totalTokens = (apiKeyRecord.totalTokens || 0) + totalTokens;
+    apiKeyRecord.lastUsedAt = new Date().toISOString();
+
+    const logEntry: StoredRequestLog = {
+      id: 'log_' + crypto.randomBytes(5).toString('hex'),
+      userId: apiKeyRecord.userId,
+      apiKeyId: apiKeyRecord.id,
+      model: requestedModelRaw,
+      routedModel: effectiveModel,
+      provider: providerUsed,
+      promptTokens,
+      completionTokens,
+      totalTokens,
+      costUsd: cost,
+      latencyMs: Date.now() - startTime,
+      status: 200,
+      timestamp: new Date().toISOString(),
+      failoverAttempts: failoverCount,
+      fallbackRouted: usedFallbackModel
+    };
+
+    masterLogs.unshift(logEntry);
+    if (masterLogs.length > 500) masterLogs.length = 500;
+
+    const userAccount = masterUsers.get(apiKeyRecord.userId);
+    if (userAccount) {
+      ensureDailyCreditsReset(userAccount);
+      userAccount.freeCreditsSpent = (userAccount.freeCreditsSpent || 0) + totalTokens;
+      userAccount.updatedAt = new Date().toISOString();
+      dbOps.push(
+        patchItemInRtdb(
+          'user_profiles',
+          userAccount.uid,
+          {
+            freeCreditsSpent: userAccount.freeCreditsSpent,
+            lastResetDate: userAccount.lastResetDate,
+            updatedAt: userAccount.updatedAt
+          },
+          fbToken
+        ).catch(() => false)
+      );
+    }
+
+    if (!isVirtualDashboardSession) {
+      dbOps.push(
+        patchItemInRtdb(
+          'api_keys',
+          apiKeyRecord.id,
+          {
+            totalRequests: apiKeyRecord.totalRequests,
+            totalTokens: apiKeyRecord.totalTokens,
+            lastUsedAt: apiKeyRecord.lastUsedAt
+          },
+          fbToken
+        ).catch(() => false)
+      );
+    }
+    dbOps.push(upsertItemInRtdb('request_logs', logEntry.id, logEntry, fbToken).catch(() => false));
+  }
+
+  if (dbOps.length > 0) {
+    await Promise.race([
+      Promise.allSettled(dbOps),
+      new Promise<void>((resolve) => setTimeout(resolve, 2500))
+    ]);
   }
 
   if (!success) {
-    const statusToSend = candidateKeys.length === 0 ? 404 : (lastErrorStatus >= 400 ? lastErrorStatus : 502);
-    const errorMessage = candidateKeys.length === 0
-      ? `No active Admin Pool provider keys are configured yet to handle "${model}". Add a valid provider API key in the Admin Panel (/admin).`
-      : `Upstream request for "${effectiveModel}" failed after rotating across ${failoverCount} key attempt(s): ${lastErrorMsg.slice(0, 220)}`;
+    const statusToSend = candidateKeys.length === 0 && availableKeys.length === 0
+      ? 503
+      : candidateKeys.length === 0 && failoverCount === 0
+      ? 404
+      : lastErrorStatus >= 400
+      ? lastErrorStatus
+      : 502;
 
-    res.status(statusToSend).json({
-      error: {
-        message: errorMessage,
-        type: candidateKeys.length === 0 ? 'model_not_found' : 'gateway_upstream_error',
-        code: candidateKeys.length === 0 ? 'model_not_found' : 'upstream_failed',
-        requested_model: model,
-        routed_model: effectiveModel,
-        failover_count: failoverCount
-      }
-    });
+    const errorMessage =
+      availableKeys.length === 0
+        ? `No active Admin Pool provider keys are currently healthy to serve "${requestedModelRaw}". Add or reset provider keys in the Admin Panel (/admin).`
+        : `Upstream request for "${effectiveModel}" failed after rotating across ${failoverCount} key/model attempt(s): ${lastErrorMsg.slice(0, 260)}`;
+
+    if (!res.headersSent) {
+      res.status(statusToSend).json({
+        error: {
+          message: errorMessage,
+          type: statusToSend === 429 ? 'rate_limit_error' : statusToSend === 404 ? 'model_not_found' : 'gateway_upstream_error',
+          code: statusToSend === 429 ? 'upstream_rate_limited' : statusToSend === 404 ? 'model_not_found' : 'upstream_failed',
+          requested_model: requestedModelRaw,
+          routed_model: effectiveModel,
+          failover_count: failoverCount
+        }
+      });
+    } else if (!res.writableEnded) {
+      res.end();
+    }
     return;
   }
 
-  const totalTokens = promptTokens + completionTokens;
-  const cost = (promptTokens * 0.000002) + (completionTokens * 0.000006);
-
-  apiKeyRecord.totalRequests = (apiKeyRecord.totalRequests || 0) + 1;
-  apiKeyRecord.totalTokens = (apiKeyRecord.totalTokens || 0) + totalTokens;
-  apiKeyRecord.lastUsedAt = new Date().toISOString();
-
-  const logEntry: StoredRequestLog = {
-    id: 'log_' + Math.random().toString(36).substring(2, 10),
-    userId: apiKeyRecord.userId,
-    apiKeyId: apiKeyRecord.id,
-    model: String(model),
-    routedModel: effectiveModel,
-    provider: providerUsed,
-    promptTokens,
-    completionTokens,
-    totalTokens,
-    costUsd: cost,
-    latencyMs: Date.now() - startTime,
-    status: 200,
-    timestamp: new Date().toISOString(),
-    failoverAttempts: failoverCount,
-    fallbackRouted: usedFallbackModel
-  };
-
-  masterLogs.unshift(logEntry);
-  if (masterLogs.length > 500) masterLogs.length = 500;
-
-  const userAccount = masterUsers.get(apiKeyRecord.userId);
-  if (userAccount) {
-    ensureDailyCreditsReset(userAccount);
-    userAccount.freeCreditsSpent = (userAccount.freeCreditsSpent || 0) + totalTokens;
-    userAccount.updatedAt = new Date().toISOString();
+  if (pendingResponseAction) {
+    pendingResponseAction();
   }
-
-
-  // Background Firebase RTDB persistence for usage, key stats, and telemetry log
-  Promise.all([
-    upsertItemInRtdb('api_keys', apiKeyRecord.id, apiKeyRecord),
-    upsertItemInRtdb('request_logs', logEntry.id, logEntry)
-  ]).catch(() => {});
 };
 
 gatewayApp.post('/v1/chat/completions', validateGatewayKey, handleChatCompletions);

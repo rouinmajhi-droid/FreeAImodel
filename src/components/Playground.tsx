@@ -14,20 +14,48 @@ import { ApiKey, GatewayModel } from '../types/gateway';
 import { useToast } from './Toast';
 import { parseJsonSafe } from '../lib/http';
 
+const NON_CHAT_MODEL_RE =
+  /realtime|tts|whisper|transcribe|image|dall-e|sora|embedding|moderation|gpt-audio|gpt-live|diarize|babbage|davinci|chat-latest/i;
+const PREFERRED_DEFAULT_MODELS = [
+  'gpt-4o-mini',
+  'gpt-4o',
+  'gpt-4.1-mini',
+  'gpt-4.1',
+  'llama-3.3-70b-versatile',
+  'llama-3.1-8b-instant',
+  'gemini-2.5-flash',
+  'deepseek-chat',
+  'mercury'
+];
+
+function pickDefaultChatModel(models: GatewayModel[]): string {
+  if (!models || models.length === 0) return '';
+  for (const preferred of PREFERRED_DEFAULT_MODELS) {
+    const match = models.find((m) => m.id.toLowerCase() === preferred);
+    if (match) return match.id;
+  }
+  const chatCapable = models.find((m) => !NON_CHAT_MODEL_RE.test(m.id));
+  return chatCapable?.id || models[0]?.id || '';
+}
+
 interface PlaygroundProps {
   apiKeys: ApiKey[];
   models: GatewayModel[];
   selectedKey?: string;
+  userUid?: string;
+  getIdToken?: () => Promise<string | undefined>;
 }
 
 export const Playground: React.FC<PlaygroundProps> = ({
   apiKeys,
   models,
   selectedKey: initialSelectedKey,
+  userUid,
+  getIdToken,
 }) => {
   const { showToast } = useToast();
   const [selectedApiKey, setSelectedApiKey] = useState(initialSelectedKey || apiKeys[0]?.key || '');
-  const [selectedModel, setSelectedModel] = useState(models[0]?.id || '');
+  const [selectedModel, setSelectedModel] = useState(() => pickDefaultChatModel(models));
   const [systemPrompt, setSystemPrompt] = useState('You are a helpful, senior technical AI assistant.');
   const [userPrompt, setUserPrompt] = useState('Explain how an API Gateway with multi-provider 429 rotation ensures 99.99% uptime.');
   const [temperature, setTemperature] = useState(0.7);
@@ -44,6 +72,8 @@ export const Playground: React.FC<PlaygroundProps> = ({
   const [metaStats, setMetaStats] = useState<{
     latencyMs?: number;
     provider?: string;
+    routedModel?: string;
+    fallbackRouted?: boolean;
     failovers?: number;
     tokens?: number;
   } | null>(null);
@@ -60,12 +90,12 @@ export const Playground: React.FC<PlaygroundProps> = ({
     if (models.length === 0) {
       setSelectedModel('');
     } else if (!selectedModel || !models.some(m => m.id === selectedModel)) {
-      setSelectedModel(models[0].id);
+      setSelectedModel(pickDefaultChatModel(models));
     }
   }, [models, selectedModel]);
 
   const handleSend = async () => {
-    if (!selectedApiKey) {
+    if (!selectedApiKey && !userUid && !getIdToken) {
       showToast('Key Required', 'Please select or generate a Gateway API key first.', 'error');
       return;
     }
@@ -99,12 +129,18 @@ export const Playground: React.FC<PlaygroundProps> = ({
         stream: isStreaming
       };
 
+      const fbToken = getIdToken ? await getIdToken() : undefined;
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'x-dashboard-client': '1',
+        ...(userUid ? { 'x-user-uid': userUid } : {}),
+        ...(fbToken ? { 'x-firebase-token': fbToken } : {}),
+        ...(selectedApiKey ? { 'Authorization': `Bearer ${selectedApiKey}` } : {})
+      };
+
       const response = await fetch('/v1/chat/completions', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${selectedApiKey}`
-        },
+        headers,
         body: JSON.stringify(payload)
       });
 
@@ -113,6 +149,8 @@ export const Playground: React.FC<PlaygroundProps> = ({
       }
 
       const providerHeader = response.headers.get('x-gateway-provider') || 'auto-resolved';
+      const routedModelHeader = response.headers.get('x-gateway-model') || selectedModel;
+      const fallbackHeader = response.headers.get('x-gateway-fallback') === 'true';
       const failoverHeader = parseInt(response.headers.get('x-gateway-failover-count') || '0', 10);
 
       // Handle Streaming
@@ -120,13 +158,15 @@ export const Playground: React.FC<PlaygroundProps> = ({
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let accumulated = '';
+        let sseBuffer = '';
 
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
 
-          const chunk = decoder.decode(value, { stream: true });
-          const lines = chunk.split('\n');
+          sseBuffer += decoder.decode(value, { stream: true });
+          const lines = sseBuffer.split('\n');
+          sseBuffer = lines.pop() || '';
 
           for (const line of lines) {
             const trimmed = line.trim();
@@ -136,7 +176,7 @@ export const Playground: React.FC<PlaygroundProps> = ({
                 const delta = parsed.choices?.[0]?.delta?.content || '';
                 accumulated += delta;
                 setResponseText(accumulated);
-              } catch (e) {
+              } catch {
                 // Ignore parse errors on partial frames
               }
             }
@@ -148,12 +188,16 @@ export const Playground: React.FC<PlaygroundProps> = ({
         setMetaStats({
           latencyMs: totalLatency,
           provider: providerHeader,
+          routedModel: routedModelHeader,
+          fallbackRouted: fallbackHeader,
           failovers: failoverHeader,
           tokens: estTokens,
         });
         setRawResponse({
           stream: true,
           provider: providerHeader,
+          routed_model: routedModelHeader,
+          fallback_routed: fallbackHeader,
           failovers: failoverHeader,
           latency_ms: totalLatency,
           content: accumulated
@@ -168,6 +212,8 @@ export const Playground: React.FC<PlaygroundProps> = ({
         setMetaStats({
           latencyMs: data.gateway_meta?.latency_ms || (Date.now() - start),
           provider: data.gateway_meta?.provider_used || providerHeader,
+          routedModel: data.gateway_meta?.routed_model || routedModelHeader,
+          fallbackRouted: data.gateway_meta?.fallback_routed ?? fallbackHeader,
           failovers: data.gateway_meta?.failover_count ?? failoverHeader,
           tokens: data.usage?.total_tokens || Math.round(content.length / 4),
         });

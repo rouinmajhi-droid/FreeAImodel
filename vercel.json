@@ -10,16 +10,16 @@
       "source": "/v1/(.*)",
       "headers": [
         { "key": "Access-Control-Allow-Origin", "value": "*" },
-        { "key": "Access-Control-Allow-Methods", "value": "GET, POST, OPTIONS, PUT, DELETE" },
-        { "key": "Access-Control-Allow-Headers", "value": "Content-Type, Authorization, x-api-key, x-user-email, x-firebase-token" }
+        { "key": "Access-Control-Allow-Methods", "value": "GET, POST, OPTIONS, PUT, DELETE, PATCH" },
+        { "key": "Access-Control-Allow-Headers", "value": "Content-Type, Authorization, x-api-key, x-user-email, x-user-uid, x-firebase-token, x-dashboard-client" }
       ]
     },
     {
       "source": "/api/(.*)",
       "headers": [
         { "key": "Access-Control-Allow-Origin", "value": "*" },
-        { "key": "Access-Control-Allow-Methods", "value": "GET, POST, OPTIONS, PUT, DELETE" },
-        { "key": "Access-Control-Allow-Headers", "value": "Content-Type, Authorization, x-api-key, x-user-email, x-firebase-token" }
+        { "key": "Access-Control-Allow-Methods", "value": "GET, POST, OPTIONS, PUT, DELETE, PATCH" },
+        { "key": "Access-Control-Allow-Headers", "value": "Content-Type, Authorization, x-api-key, x-user-email, x-user-uid, x-firebase-token, x-dashboard-client" }
       ]
     },
     {
