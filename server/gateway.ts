@@ -280,6 +280,24 @@ export async function ensureGatewayHydrated(explicitIdToken?: string, force = fa
 
       if (masterProviderKeys.length > 0 && masterModels.size === 0) {
         rebuildMasterModelsFromPool();
+      } else if (masterProviderKeys.length > 0) {
+        // Ensure any active provider_keys models missing from /models are still routable & listable
+        for (const pk of masterProviderKeys) {
+          if (pk.status === 'disabled' || !Array.isArray(pk.supportedModels)) continue;
+          for (const rawId of pk.supportedModels) {
+            const id = String(rawId || '').trim();
+            if (!id || masterModels.has(id)) continue;
+            masterModels.set(id, {
+              id,
+              name: formatModelDisplayName(id),
+              provider: pk.provider,
+              ownerKeyId: pk.id,
+              ownerKeyHint: pk.keyHint,
+              isActive: true,
+              discoveredAt: pk.updatedAt || pk.createdAt || new Date().toISOString()
+            });
+          }
+        }
       }
 
       if (Array.isArray(dbApiKeys)) {
@@ -1034,53 +1052,65 @@ export async function optionalFlexibleGatewayAuth(req: Request, res: Response, n
   next();
 }
 
+function buildSingleOpenAiModel(m: StoredModel, createdTs = Math.floor(Date.now() / 1000)) {
+  return {
+    id: m.id,
+    object: 'model',
+    created: m.discoveredAt ? Math.floor(new Date(m.discoveredAt).getTime() / 1000) || createdTs : createdTs,
+    owned_by: 'freeaimodel',
+    provider: m.provider,
+    name: m.name || formatModelDisplayName(m.id),
+    ownerKeyId: m.ownerKeyId,
+    ownerKeyHint: m.ownerKeyHint,
+    permission: [{
+      id: `modelperm-${m.id}`,
+      object: 'model_permission',
+      created: createdTs,
+      allow_create_engine: false,
+      allow_sampling: true,
+      allow_logprobs: true,
+      allow_search_indices: false,
+      allow_view: true,
+      allow_fine_tuning: false,
+      organization: '*',
+      group: null,
+      is_blocking: false
+    }],
+    root: m.id,
+    parent: null
+  };
+}
+
 function buildOpenAiModelsList() {
   const createdTs = Math.floor(Date.now() / 1000);
+  const items = Array.from(masterModels.values())
+    .filter((m) => m && m.id && m.isActive !== false)
+    .map((m) => buildSingleOpenAiModel(m, createdTs));
   return {
     object: 'list',
-    data: Array.from(masterModels.values()).map(m => ({
-      id: m.id,
-      object: 'model',
-      created: m.discoveredAt ? Math.floor(new Date(m.discoveredAt).getTime() / 1000) || createdTs : createdTs,
-      owned_by: 'freeaimodel',
-      provider: m.provider,
-      name: m.name || formatModelDisplayName(m.id),
-      ownerKeyId: m.ownerKeyId,
-      ownerKeyHint: m.ownerKeyHint,
-      permission: [{
-        id: `modelperm-${m.id}`,
-        object: 'model_permission',
-        created: createdTs,
-        allow_create_engine: false,
-        allow_sampling: true,
-        allow_logprobs: true,
-        allow_search_indices: false,
-        allow_view: true,
-        allow_fine_tuning: false,
-        organization: '*',
-        group: null,
-        is_blocking: false
-      }],
-      root: m.id,
-      parent: null
-    }))
+    data: items
   };
 }
 
 async function ensureLiveModelsDiscoveredFromPool(explicitIdToken?: string): Promise<void> {
-  if (masterModels.size > 0) return;
   const activePool = masterProviderKeys.filter(k => k.status !== 'disabled');
   if (activePool.length === 0) return;
 
-  rebuildMasterModelsFromPool();
-  if (masterModels.size > 0) return;
+  if (masterModels.size === 0) {
+    rebuildMasterModelsFromPool();
+  }
 
-  // Pool keys exist in RTDB without cached supportedModels: fetch live upstream models now
+  // Discover live upstream models for any active key that has an empty supportedModels list
+  const keysNeedingDiscovery = activePool.filter(
+    k => (!Array.isArray(k.supportedModels) || k.supportedModels.length === 0) && !isMaskedOrInvalidHeaderKey(k.key)
+  );
+  if (keysNeedingDiscovery.length === 0) return;
+
   const CONCURRENCY = 6;
   const updatedKeys: Record<string, StoredProviderKey> = {};
-  for (let i = 0; i < activePool.length; i += CONCURRENCY) {
+  for (let i = 0; i < keysNeedingDiscovery.length; i += CONCURRENCY) {
     await Promise.all(
-      activePool.slice(i, i + CONCURRENCY).map(async (pKey) => {
+      keysNeedingDiscovery.slice(i, i + CONCURRENCY).map(async (pKey) => {
         try {
           const discovered = await fetchUpstreamModels(pKey.provider, pKey.key, pKey.customBaseUrl, pKey.id, pKey.keyHint);
           pKey.supportedModels = discovered;
@@ -1106,21 +1136,47 @@ async function ensureLiveModelsDiscoveredFromPool(explicitIdToken?: string): Pro
 // ==========================================
 gatewayApp.get('/api/models', async (req: Request, res: Response) => {
   const fbToken = extractFirebaseToken(req);
-  await ensureGatewayHydrated(fbToken, masterProviderKeys.length === 0);
+  await ensureGatewayHydrated(fbToken, masterProviderKeys.length === 0 || masterModels.size === 0);
   await ensureLiveModelsDiscoveredFromPool(fbToken);
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.json(buildOpenAiModelsList());
 });
 
 // ==========================================
-// Route: GET /v1/models & GET /models (Strict Key Verification if provided + Public Discovery)
+// Route: GET /v1/models, GET /v1/models/:modelId & GET /models
 // ==========================================
 gatewayApp.get('/v1/models', optionalFlexibleGatewayAuth, async (req: Request, res: Response) => {
   const fbToken = extractFirebaseToken(req);
-  await ensureGatewayHydrated(fbToken, masterProviderKeys.length === 0);
+  await ensureGatewayHydrated(fbToken, masterProviderKeys.length === 0 || masterModels.size === 0);
   await ensureLiveModelsDiscoveredFromPool(fbToken);
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.json(buildOpenAiModelsList());
+});
+
+gatewayApp.get('/v1/models/:modelId', optionalFlexibleGatewayAuth, async (req: Request, res: Response) => {
+  const fbToken = extractFirebaseToken(req);
+  await ensureGatewayHydrated(fbToken, masterProviderKeys.length === 0 || masterModels.size === 0);
+  await ensureLiveModelsDiscoveredFromPool(fbToken);
+
+  const requestedId = String(req.params.modelId || '').trim();
+  const match =
+    masterModels.get(requestedId) ||
+    Array.from(masterModels.values()).find((m) => m.id.toLowerCase() === requestedId.toLowerCase()) ||
+    Array.from(masterModels.values()).find((m) => !NON_CHAT_MODEL_RE.test(m.id));
+
+  if (!match) {
+    res.status(404).json({
+      error: {
+        message: `No active models found for '${requestedId}'.`,
+        type: 'invalid_request_error',
+        code: 'model_not_found'
+      }
+    });
+    return;
+  }
+
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.json(buildSingleOpenAiModel({ ...match, id: requestedId }));
 });
 
 gatewayApp.get('/models', optionalFlexibleGatewayAuth, async (req: Request, res: Response, next: NextFunction) => {
@@ -1134,7 +1190,7 @@ gatewayApp.get('/models', optionalFlexibleGatewayAuth, async (req: Request, res:
   }
 
   const fbToken = extractFirebaseToken(req);
-  await ensureGatewayHydrated(fbToken, masterProviderKeys.length === 0);
+  await ensureGatewayHydrated(fbToken, masterProviderKeys.length === 0 || masterModels.size === 0);
   await ensureLiveModelsDiscoveredFromPool(fbToken);
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.json(buildOpenAiModelsList());
@@ -1146,6 +1202,18 @@ gatewayApp.get('/models', optionalFlexibleGatewayAuth, async (req: Request, res:
 const NON_CHAT_MODEL_RE =
   /realtime|tts|whisper|transcribe|image|dall-e|sora|embedding|moderation|gpt-audio|gpt-live|diarize|babbage|davinci|chat-latest/i;
 const REASONING_OR_GPT5_RE = /^((gpt-5)|o[134])(-|$)/i;
+const DEFAULT_PROVIDER_CHAT_MODEL: Record<string, string> = {
+  groq: 'llama-3.3-70b-versatile',
+  openrouter: 'meta-llama/llama-3.3-70b-instruct:free',
+  openai: 'gpt-4o-mini',
+  gemini: 'gemini-2.5-flash',
+  deepseek: 'deepseek-chat',
+  mistral: 'mistral-small-latest',
+  cerebras: 'llama-3.3-70b',
+  inception: 'mercury',
+  anthropic: 'claude-3-5-sonnet-latest',
+  custom: 'gpt-4o-mini'
+};
 const PREFERRED_CHAT_IDS = [
   'gpt-4o-mini',
   'gpt-4o',
@@ -1153,6 +1221,8 @@ const PREFERRED_CHAT_IDS = [
   'gpt-4.1',
   'llama-3.3-70b-versatile',
   'llama-3.1-8b-instant',
+  'meta-llama/llama-3.3-70b-instruct:free',
+  'openrouter/free',
   'gemini-2.5-flash',
   'gemini-2.0-flash',
   'deepseek-chat',
@@ -1499,19 +1569,23 @@ const handleChatCompletions = async (req: Request, res: Response) => {
     if (!omitOptionalParams) {
       if (isReasoningOrGpt5) {
         const cap = max_completion_tokens ?? max_tokens;
-        if (cap !== undefined) payload.max_completion_tokens = cap;
+        if (cap !== undefined && cap !== null) payload.max_completion_tokens = cap;
       } else {
-        if (temperature !== undefined) payload.temperature = temperature;
-        if (max_tokens !== undefined) payload.max_tokens = max_tokens;
-        if (max_completion_tokens !== undefined) payload.max_completion_tokens = max_completion_tokens;
-        if (top_p !== undefined) payload.top_p = top_p;
+        if (temperature !== undefined && temperature !== null) payload.temperature = temperature;
+        if (max_tokens !== undefined && max_tokens !== null) payload.max_tokens = max_tokens;
+        if (max_completion_tokens !== undefined && max_completion_tokens !== null) payload.max_completion_tokens = max_completion_tokens;
+        if (top_p !== undefined && top_p !== null) payload.top_p = top_p;
       }
-      if (stop !== undefined) payload.stop = stop;
-      if (presence_penalty !== undefined && !isReasoningOrGpt5) payload.presence_penalty = presence_penalty;
-      if (frequency_penalty !== undefined && !isReasoningOrGpt5) payload.frequency_penalty = frequency_penalty;
-      if (tools !== undefined) payload.tools = tools;
-      if (tool_choice !== undefined) payload.tool_choice = tool_choice;
-      if (response_format !== undefined) payload.response_format = response_format;
+      if (stop !== undefined && stop !== null) payload.stop = stop;
+      if (presence_penalty !== undefined && presence_penalty !== null && !isReasoningOrGpt5) {
+        payload.presence_penalty = presence_penalty;
+      }
+      if (frequency_penalty !== undefined && frequency_penalty !== null && !isReasoningOrGpt5) {
+        payload.frequency_penalty = frequency_penalty;
+      }
+      if (tools !== undefined && tools !== null) payload.tools = tools;
+      if (tool_choice !== undefined && tool_choice !== null) payload.tool_choice = tool_choice;
+      if (response_format !== undefined && response_format !== null) payload.response_format = response_format;
       if (stream && (providerKey.provider === 'openai' || providerKey.provider === 'groq')) {
         payload.stream_options = { include_usage: true };
       }
@@ -1799,31 +1873,58 @@ const handleChatCompletions = async (req: Request, res: Response) => {
     }
   }
 
-  // Stage 2: Smart Multi-Tier Fallback (Tier 2A: Other Healthy Providers -> Tier 2B: Healthy Alternate Chat Models)
+  // Stage 2: Smart Multi-Tier Fallback — automatically route to ANY healthy active provider/model (Groq, OpenRouter, Gemini, etc.)
   if (!success && availableKeys.length > 0) {
     const primaryProvidersTried = new Set(candidateKeys.map((k) => k.provider));
     const healthyPool = masterProviderKeys.filter(
       (k) => k.status === 'active' && !isMaskedOrInvalidHeaderKey(k.key)
     );
 
-    // Tier 2A: Try healthy keys from DIFFERENT providers first (cross-provider failover)
-    const otherProviderKeys = healthyPool.filter((k) => !primaryProvidersTried.has(k.provider));
-    // Tier 2B: Try remaining active keys with an alternate proven chat model (cross-model fallback)
-    const sameProviderRemainingKeys = healthyPool.filter((k) => primaryProvidersTried.has(k.provider));
+    // Tier 2A: Prioritize healthy keys from alternate working providers (e.g. Groq, OpenRouter, Gemini, DeepSeek)
+    const otherProviderKeys = healthyPool
+      .filter((k) => !primaryProvidersTried.has(k.provider))
+      .sort((a, b) => (a.errorCount || 0) - (b.errorCount || 0));
+    // Tier 2B: Remaining active keys (alternate chat-capable models on same provider)
+    const sameProviderRemainingKeys = healthyPool
+      .filter((k) => primaryProvidersTried.has(k.provider))
+      .sort((a, b) => (a.errorCount || 0) - (b.errorCount || 0));
 
     const orderedFallbackKeys = [...otherProviderKeys, ...sameProviderRemainingKeys];
+    const MAX_FALLBACK_ATTEMPTS = Math.max(20, orderedFallbackKeys.length * 2);
     let fallbackAttempts = 0;
-    const MAX_FALLBACK_ATTEMPTS = 8;
 
     for (const backupKey of orderedFallbackKeys) {
       if (fallbackAttempts >= MAX_FALLBACK_ATTEMPTS) break;
+      if (backupKey.status !== 'active') continue;
+
+      // Auto-discover supported models on-the-fly if a manually inserted active key had empty supportedModels
+      if (!Array.isArray(backupKey.supportedModels) || backupKey.supportedModels.length === 0) {
+        try {
+          const discovered = await fetchUpstreamModels(
+            backupKey.provider,
+            backupKey.key,
+            backupKey.customBaseUrl,
+            backupKey.id,
+            backupKey.keyHint,
+            true
+          );
+          if (discovered.length > 0) {
+            backupKey.supportedModels = discovered;
+            backupKey.updatedAt = new Date().toISOString();
+            dirtyProviderKeys.add(backupKey);
+          }
+        } catch {
+          // Fall back to provider's known default chat model below
+        }
+      }
 
       const pickedForKey = pickChatModelForPool([backupKey], triedModels);
       const fallbackModel =
         pickedForKey?.id ||
         backupKey.supportedModels?.find((id) => !NON_CHAT_MODEL_RE.test(id) && !triedModels.has(id)) ||
         backupKey.supportedModels?.find((id) => !NON_CHAT_MODEL_RE.test(id)) ||
-        effectiveModel;
+        DEFAULT_PROVIDER_CHAT_MODEL[backupKey.provider] ||
+        'gpt-4o-mini';
 
       if (triedPairs.has(`${backupKey.id}::${fallbackModel}`)) continue;
 
