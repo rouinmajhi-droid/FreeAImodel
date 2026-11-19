@@ -179,10 +179,17 @@ export function sanitizeForRtdb<T = any>(value: T): T {
   return value;
 }
 
-export async function listCollectionFromRtdb<T = Record<string, any>>(
+export interface RtdbReadResult<T> {
+  ok: boolean;
+  status: number;
+  items: T[];
+  error?: string;
+}
+
+export async function fetchCollectionDetailedFromRtdb<T = Record<string, any>>(
   nodeName: string,
   explicitIdToken?: string
-): Promise<T[] | null> {
+): Promise<RtdbReadResult<T>> {
   try {
     const url = await buildAuthorizedRtdbUrl(nodeName, {}, explicitIdToken);
     const res = await fetch(url, {
@@ -194,26 +201,48 @@ export async function listCollectionFromRtdb<T = Record<string, any>>(
     if (!res.ok) {
       const errText = await res.text().catch(() => '');
       console.warn(`[RTDB] GET /${nodeName}.json failed (${res.status}):`, errText.slice(0, 200));
-      return null;
+      return {
+        ok: false,
+        status: res.status,
+        items: [],
+        error: errText.slice(0, 200) || res.statusText
+      };
     }
 
     const data: any = await res.json();
-    if (!data || typeof data !== 'object') return [];
-
-    if (Array.isArray(data)) {
-      return data.filter(Boolean) as T[];
+    if (!data || typeof data !== 'object') {
+      return { ok: true, status: res.status, items: [] };
     }
 
-    return Object.entries(data)
+    if (Array.isArray(data)) {
+      return { ok: true, status: res.status, items: data.filter(Boolean) as T[] };
+    }
+
+    const items = Object.entries(data)
       .filter(([, val]) => val && typeof val === 'object')
       .map(([key, val]: [string, any]) => ({
         ...val,
         id: val.id || key
       })) as T[];
-  } catch (err) {
+
+    return { ok: true, status: res.status, items };
+  } catch (err: any) {
     console.warn(`[RTDB] Exception GET /${nodeName}.json:`, err);
-    return null;
+    return {
+      ok: false,
+      status: 0,
+      items: [],
+      error: err?.message || 'Network exception reaching RTDB'
+    };
   }
+}
+
+export async function listCollectionFromRtdb<T = Record<string, any>>(
+  nodeName: string,
+  explicitIdToken?: string
+): Promise<T[] | null> {
+  const result = await fetchCollectionDetailedFromRtdb<T>(nodeName, explicitIdToken);
+  return result.ok ? result.items : null;
 }
 
 export async function upsertItemInRtdb(

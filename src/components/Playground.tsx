@@ -15,7 +15,7 @@ import { useToast } from './Toast';
 import { parseJsonSafe } from '../lib/http';
 
 const NON_CHAT_MODEL_RE =
-  /realtime|tts|whisper|transcribe|image|dall-e|sora|embedding|moderation|gpt-audio|gpt-live|diarize|babbage|davinci|chat-latest/i;
+  /realtime|tts|whisper|transcribe|image|dall-e|sora|embedding|embed|rerank|moderation|gpt-audio|gpt-live|audio|speech|orpheus|prompt-guard|guard|diarize|babbage|davinci|chat-latest|:batch/i;
 const PREFERRED_DEFAULT_MODELS = [
   'gpt-4o-mini',
   'gpt-4o',
@@ -23,6 +23,8 @@ const PREFERRED_DEFAULT_MODELS = [
   'gpt-4.1',
   'llama-3.3-70b-versatile',
   'llama-3.1-8b-instant',
+  'meta-llama/llama-3.3-70b-instruct:free',
+  'openrouter/free',
   'gemini-2.5-flash',
   'deepseek-chat',
   'mercury'
@@ -34,8 +36,10 @@ function pickDefaultChatModel(models: GatewayModel[]): string {
     const match = models.find((m) => m.id.toLowerCase() === preferred);
     if (match) return match.id;
   }
-  const chatCapable = models.find((m) => !NON_CHAT_MODEL_RE.test(m.id));
-  return chatCapable?.id || models[0]?.id || '';
+  const freeChat = models.find((m) => !m.id.startsWith('~') && m.id.includes(':free') && !NON_CHAT_MODEL_RE.test(m.id));
+  if (freeChat) return freeChat.id;
+  const chatCapable = models.find((m) => !m.id.startsWith('~') && !NON_CHAT_MODEL_RE.test(m.id));
+  return chatCapable?.id || models.find((m) => !NON_CHAT_MODEL_RE.test(m.id))?.id || models[0]?.id || '';
 }
 
 interface PlaygroundProps {

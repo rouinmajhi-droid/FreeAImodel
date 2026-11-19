@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import dotenv from 'dotenv';
 import {
   listCollectionFromRtdb,
+  fetchCollectionDetailedFromRtdb,
   upsertItemInRtdb,
   patchItemInRtdb,
   patchCollectionInRtdb,
@@ -11,8 +12,13 @@ import {
   syncModelsInRtdb,
   hasServerAdminCredentials,
   getRtdbBridgeStatus,
-  verifyFirebaseIdToken
+  verifyFirebaseIdToken,
+  toRtdbKey
 } from './rtdbStore.js';
+import {
+  loadPersistentGatewaySnapshot,
+  savePersistentGatewaySnapshot
+} from './localStore.js';
 
 dotenv.config();
 
@@ -89,6 +95,9 @@ export interface StoredModel {
   provider: string;
   ownerKeyId?: string;
   ownerKeyHint?: string;
+  upstreamModel?: string;
+  customBaseUrl?: string;
+  upstreamApiKey?: string;
   contextWindow?: number;
   pricingPrompt?: number;
   pricingCompletion?: number;
@@ -162,18 +171,63 @@ export const masterLogs: StoredRequestLog[] = [];
 export const masterUsers = new Map<string, StoredUserAccount>();
 
 let lastHydratedAt = 0;
+let localStoreLoaded = false;
 let hydrationInFlight: Promise<void> | null = null;
+const lastRtdbDiagnostics: Record<string, { ok: boolean; status: number; error?: string }> = {};
 
 function extractFirebaseToken(req: Request): string | undefined {
   const token = req.headers['x-firebase-token'];
   return typeof token === 'string' && token.trim().length > 20 ? token.trim() : undefined;
 }
 
+export async function persistGatewaySnapshot(): Promise<void> {
+  await savePersistentGatewaySnapshot({
+    apiKeys: Array.from(masterApiKeys.values()),
+    providerKeys: [...masterProviderKeys],
+    models: Array.from(masterModels.values()),
+    logs: [...masterLogs],
+    users: Array.from(masterUsers.values())
+  });
+}
+
+function hydrateFromLocalSnapshotIfNeeded(): void {
+  if (localStoreLoaded) return;
+  localStoreLoaded = true;
+  const snap = loadPersistentGatewaySnapshot();
+  if (!snap) return;
+
+  if (masterProviderKeys.length === 0 && snap.providerKeys.length > 0) {
+    for (const pk of snap.providerKeys) {
+      if (pk?.id && pk?.key) masterProviderKeys.push(pk as StoredProviderKey);
+    }
+  }
+  if (masterModels.size === 0 && snap.models.length > 0) {
+    for (const m of snap.models) {
+      if (m?.id && m?.isActive !== false) masterModels.set(String(m.id), m as StoredModel);
+    }
+  }
+  if (masterApiKeys.size === 0 && snap.apiKeys.length > 0) {
+    for (const ak of snap.apiKeys) {
+      if (ak?.key) masterApiKeys.set(String(ak.key), ak as StoredApiKey);
+    }
+  }
+  if (masterLogs.length === 0 && snap.logs.length > 0) {
+    masterLogs.push(...(snap.logs as StoredRequestLog[]));
+  }
+  if (masterUsers.size === 0 && snap.users.length > 0) {
+    for (const u of snap.users) {
+      if (u?.uid) masterUsers.set(String(u.uid), u as StoredUserAccount);
+    }
+  }
+}
+
 /**
  * Hydrate in-memory stores directly from Firebase Realtime Database on cold starts or TTL expiry.
- * Supports normalized fields across admin/external writers and only updates TTL when RTDB responds.
+ * Falls back gracefully to disk snapshot when RTDB denies unauthenticated reads on private paths (401).
  */
 export async function ensureGatewayHydrated(explicitIdToken?: string, force = false): Promise<void> {
+  hydrateFromLocalSnapshotIfNeeded();
+
   const now = Date.now();
   if (!force && lastHydratedAt > 0 && now - lastHydratedAt < 3_000) return;
 
@@ -184,18 +238,25 @@ export async function ensureGatewayHydrated(explicitIdToken?: string, force = fa
 
   hydrationInFlight = (async () => {
     try {
-      const [dbProviderKeys, dbModels, dbApiKeys, dbLogs, dbUsers] = await Promise.all([
-        listCollectionFromRtdb<any>('provider_keys', explicitIdToken),
-        listCollectionFromRtdb<any>('models', explicitIdToken),
-        listCollectionFromRtdb<any>('api_keys', explicitIdToken),
-        listCollectionFromRtdb<any>('request_logs', explicitIdToken),
-        listCollectionFromRtdb<any>('user_profiles', explicitIdToken)
+      const [pkRes, modelsRes, apiKeysRes, logsRes, usersRes] = await Promise.all([
+        fetchCollectionDetailedFromRtdb<any>('provider_keys', explicitIdToken),
+        fetchCollectionDetailedFromRtdb<any>('models', explicitIdToken),
+        fetchCollectionDetailedFromRtdb<any>('api_keys', explicitIdToken),
+        fetchCollectionDetailedFromRtdb<any>('request_logs', explicitIdToken),
+        fetchCollectionDetailedFromRtdb<any>('user_profiles', explicitIdToken)
       ]);
+
+      lastRtdbDiagnostics.provider_keys = { ok: pkRes.ok, status: pkRes.status, error: pkRes.error };
+      lastRtdbDiagnostics.models = { ok: modelsRes.ok, status: modelsRes.status, error: modelsRes.error };
+      lastRtdbDiagnostics.api_keys = { ok: apiKeysRes.ok, status: apiKeysRes.status, error: apiKeysRes.error };
+      lastRtdbDiagnostics.request_logs = { ok: logsRes.ok, status: logsRes.status, error: logsRes.error };
+      lastRtdbDiagnostics.user_profiles = { ok: usersRes.ok, status: usersRes.status, error: usersRes.error };
 
       let anyRtdbSuccess = false;
 
-      if (Array.isArray(dbProviderKeys)) {
+      if (pkRes.ok) {
         anyRtdbSuccess = true;
+        const dbProviderKeys = pkRes.items;
         const byId = new Map<string, StoredProviderKey>();
         for (const existing of masterProviderKeys) byId.set(existing.id, existing);
         masterProviderKeys.length = 0;
@@ -247,8 +308,9 @@ export async function ensureGatewayHydrated(explicitIdToken?: string, force = fa
         }
       }
 
-      if (Array.isArray(dbModels)) {
+      if (modelsRes.ok) {
         anyRtdbSuccess = true;
+        const dbModels = modelsRes.items;
         masterModels.clear();
         for (const rawM of dbModels) {
           const modelId = String(rawM?.id || rawM?.modelId || '').trim();
@@ -266,6 +328,9 @@ export async function ensureGatewayHydrated(explicitIdToken?: string, force = fa
             provider: String(inferredProvider),
             ownerKeyId: rawM?.ownerKeyId ? String(rawM.ownerKeyId) : undefined,
             ownerKeyHint: rawM?.ownerKeyHint ? String(rawM.ownerKeyHint) : undefined,
+            upstreamModel: rawM?.upstreamModel ? String(rawM.upstreamModel).trim() : undefined,
+            customBaseUrl: normalizeBaseUrl(rawM?.customBaseUrl || rawM?.upstreamBaseUrl || rawM?.baseUrl),
+            upstreamApiKey: rawM?.upstreamApiKey || rawM?.apiKey ? String(rawM.upstreamApiKey || rawM.apiKey).trim() : undefined,
             contextWindow: typeof rawM?.contextWindow === 'number' ? rawM.contextWindow : undefined,
             pricingPrompt: typeof rawM?.pricingPrompt === 'number' ? rawM.pricingPrompt : undefined,
             pricingCompletion: typeof rawM?.pricingCompletion === 'number' ? rawM.pricingCompletion : undefined,
@@ -281,7 +346,6 @@ export async function ensureGatewayHydrated(explicitIdToken?: string, force = fa
       if (masterProviderKeys.length > 0 && masterModels.size === 0) {
         rebuildMasterModelsFromPool();
       } else if (masterProviderKeys.length > 0) {
-        // Ensure any active provider_keys models missing from /models are still routable & listable
         for (const pk of masterProviderKeys) {
           if (pk.status === 'disabled' || !Array.isArray(pk.supportedModels)) continue;
           for (const rawId of pk.supportedModels) {
@@ -300,8 +364,9 @@ export async function ensureGatewayHydrated(explicitIdToken?: string, force = fa
         }
       }
 
-      if (Array.isArray(dbApiKeys)) {
+      if (apiKeysRes.ok) {
         anyRtdbSuccess = true;
+        const dbApiKeys = apiKeysRes.items;
         masterApiKeys.clear();
         for (const rawAk of dbApiKeys) {
           const keySecret = String(rawAk?.key || rawAk?.apiKey || '').trim();
@@ -324,16 +389,16 @@ export async function ensureGatewayHydrated(explicitIdToken?: string, force = fa
         }
       }
 
-      if (Array.isArray(dbLogs) && dbLogs.length > 0) {
+      if (logsRes.ok && logsRes.items.length > 0) {
         anyRtdbSuccess = true;
-        const sorted = [...dbLogs].sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));
+        const sorted = [...logsRes.items].sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));
         masterLogs.length = 0;
         masterLogs.push(...sorted.slice(0, 200));
       }
 
-      if (Array.isArray(dbUsers)) {
+      if (usersRes.ok) {
         anyRtdbSuccess = true;
-        for (const u of dbUsers) {
+        for (const u of usersRes.items) {
           if (u?.uid) {
             masterUsers.set(u.uid, u);
           }
@@ -342,6 +407,7 @@ export async function ensureGatewayHydrated(explicitIdToken?: string, force = fa
 
       if (anyRtdbSuccess) {
         lastHydratedAt = Date.now();
+        void persistGatewaySnapshot();
       }
     } catch (err) {
       console.warn('[FreeAIModel] RTDB hydration error:', err);
@@ -777,6 +843,7 @@ async function resolveRegisteredGatewayKey(
   apiKeyToken: string,
   explicitIdToken?: string
 ): Promise<StoredApiKey | null> {
+  hydrateFromLocalSnapshotIfNeeded();
   const localMatch = masterApiKeys.get(apiKeyToken);
   if (localMatch) return localMatch;
 
@@ -787,6 +854,7 @@ async function resolveRegisteredGatewayKey(
   const dbMatch = await findApiKeyBySecretInRtdb<StoredApiKey>(apiKeyToken, explicitIdToken);
   if (dbMatch && dbMatch.key) {
     masterApiKeys.set(dbMatch.key, dbMatch);
+    void persistGatewaySnapshot();
     return dbMatch;
   }
 
@@ -1013,16 +1081,41 @@ export async function validateGatewayKey(req: Request, res: Response, next: Next
 }
 
 // ==========================================
-// Middleware: Flexible Auth for Model Listing (GET /v1/models & GET /models)
-// - If an API key IS supplied, verifies it strictly against registered database keys.
-// - If NO API key is supplied, allows public OpenAI-compatible model catalog discovery.
+// Middleware: Strict Auth for OpenAI Model Listing (GET /v1/models & GET /v1/models/:modelId)
+// Verifies Authorization: Bearer <sk-gateway-...> against Firebase RTDB `api_keys` / synced store.
 // ==========================================
-export async function optionalFlexibleGatewayAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
+export async function validateModelsAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
   const fbToken = extractFirebaseToken(req);
   const apiKeyToken = extractGatewayTokenFromRequest(req);
+
+  if (!apiKeyToken && fbToken) {
+    const fbUser = await verifyFirebaseIdToken(fbToken);
+    if (fbUser) {
+      (req as any).resolvedFirebaseToken = fbToken;
+      next();
+      return;
+    }
+  }
+
   if (!apiKeyToken) {
-    next();
+    res.status(401).json({
+      error: {
+        message: 'Missing Authorization header. Expected "Authorization: Bearer sk-gateway-...".',
+        type: 'invalid_request_error',
+        code: 'missing_api_key'
+      }
+    });
     return;
+  }
+
+  // Allow Firebase ID token JWT directly as Bearer token from dashboard clients
+  if (apiKeyToken.split('.').length === 3 && apiKeyToken.length > 80) {
+    const fbUser = await verifyFirebaseIdToken(apiKeyToken);
+    if (fbUser) {
+      (req as any).resolvedFirebaseToken = apiKeyToken;
+      next();
+      return;
+    }
   }
 
   const matchedKey = await resolveRegisteredGatewayKey(apiKeyToken, fbToken);
@@ -1126,7 +1219,8 @@ async function ensureLiveModelsDiscoveredFromPool(explicitIdToken?: string): Pro
   if (Object.keys(updatedKeys).length > 0) {
     await Promise.all([
       patchCollectionInRtdb('provider_keys', updatedKeys, explicitIdToken),
-      syncModelsInRtdb(Array.from(masterModels.values()), explicitIdToken)
+      syncModelsInRtdb(Array.from(masterModels.values()), explicitIdToken),
+      persistGatewaySnapshot()
     ]).catch(() => {});
   }
 }
@@ -1143,31 +1237,30 @@ gatewayApp.get('/api/models', async (req: Request, res: Response) => {
 });
 
 // ==========================================
-// Route: GET /v1/models, GET /v1/models/:modelId & GET /models
+// Route: GET /v1/models, GET /v1/models/:modelId & GET /models (Strict Bearer Auth + Live RTDB Read)
 // ==========================================
-gatewayApp.get('/v1/models', optionalFlexibleGatewayAuth, async (req: Request, res: Response) => {
-  const fbToken = extractFirebaseToken(req);
-  await ensureGatewayHydrated(fbToken, masterProviderKeys.length === 0 || masterModels.size === 0);
+gatewayApp.get('/v1/models', validateModelsAuth, async (req: Request, res: Response) => {
+  const fbToken = (req as any).resolvedFirebaseToken || extractFirebaseToken(req);
+  await ensureGatewayHydrated(fbToken, true);
   await ensureLiveModelsDiscoveredFromPool(fbToken);
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.json(buildOpenAiModelsList());
 });
 
-gatewayApp.get('/v1/models/:modelId', optionalFlexibleGatewayAuth, async (req: Request, res: Response) => {
-  const fbToken = extractFirebaseToken(req);
-  await ensureGatewayHydrated(fbToken, masterProviderKeys.length === 0 || masterModels.size === 0);
+gatewayApp.get('/v1/models/:modelId', validateModelsAuth, async (req: Request, res: Response) => {
+  const fbToken = (req as any).resolvedFirebaseToken || extractFirebaseToken(req);
+  await ensureGatewayHydrated(fbToken, true);
   await ensureLiveModelsDiscoveredFromPool(fbToken);
 
   const requestedId = String(req.params.modelId || '').trim();
   const match =
     masterModels.get(requestedId) ||
-    Array.from(masterModels.values()).find((m) => m.id.toLowerCase() === requestedId.toLowerCase()) ||
-    Array.from(masterModels.values()).find((m) => !NON_CHAT_MODEL_RE.test(m.id));
+    Array.from(masterModels.values()).find((m) => m.id.toLowerCase() === requestedId.toLowerCase());
 
   if (!match) {
     res.status(404).json({
       error: {
-        message: `No active models found for '${requestedId}'.`,
+        message: `Model '${requestedId}' was not found in Firebase active models.`,
         type: 'invalid_request_error',
         code: 'model_not_found'
       }
@@ -1176,10 +1269,10 @@ gatewayApp.get('/v1/models/:modelId', optionalFlexibleGatewayAuth, async (req: R
   }
 
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  res.json(buildSingleOpenAiModel({ ...match, id: requestedId }));
+  res.json(buildSingleOpenAiModel(match));
 });
 
-gatewayApp.get('/models', optionalFlexibleGatewayAuth, async (req: Request, res: Response, next: NextFunction) => {
+gatewayApp.get('/models', async (req: Request, res: Response, next: NextFunction) => {
   const hasExplicitKey = Boolean(extractGatewayTokenFromRequest(req));
   const acceptHeader = String(req.headers['accept'] || '').toLowerCase();
   const isBrowserHtmlNav = acceptHeader.includes('text/html') && !acceptHeader.includes('application/json') && !hasExplicitKey;
@@ -1189,18 +1282,20 @@ gatewayApp.get('/models', optionalFlexibleGatewayAuth, async (req: Request, res:
     return;
   }
 
-  const fbToken = extractFirebaseToken(req);
-  await ensureGatewayHydrated(fbToken, masterProviderKeys.length === 0 || masterModels.size === 0);
-  await ensureLiveModelsDiscoveredFromPool(fbToken);
-  res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  res.json(buildOpenAiModelsList());
+  return validateModelsAuth(req, res, async () => {
+    const fbToken = (req as any).resolvedFirebaseToken || extractFirebaseToken(req);
+    await ensureGatewayHydrated(fbToken, true);
+    await ensureLiveModelsDiscoveredFromPool(fbToken);
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.json(buildOpenAiModelsList());
+  });
 });
 
 // ==========================================
 // Route: POST /v1/chat/completions (OpenAI-compatible Universal Router + Limit-Shift Failover)
 // ==========================================
 const NON_CHAT_MODEL_RE =
-  /realtime|tts|whisper|transcribe|image|dall-e|sora|embedding|moderation|gpt-audio|gpt-live|diarize|babbage|davinci|chat-latest/i;
+  /realtime|tts|whisper|transcribe|image|dall-e|sora|embedding|embed|rerank|moderation|gpt-audio|gpt-live|audio|speech|orpheus|prompt-guard|guard|diarize|babbage|davinci|chat-latest|:batch/i;
 const REASONING_OR_GPT5_RE = /^((gpt-5)|o[134])(-|$)/i;
 const DEFAULT_PROVIDER_CHAT_MODEL: Record<string, string> = {
   groq: 'llama-3.3-70b-versatile',
@@ -1348,6 +1443,11 @@ const handleChatCompletions = async (req: Request, res: Response) => {
     return;
   }
 
+  let clientAborted = false;
+  req.on('close', () => {
+    clientAborted = true;
+  });
+
   await ensureGatewayHydrated(fbToken, masterProviderKeys.length === 0 || masterModels.size === 0);
   if (masterModels.size === 0 && masterProviderKeys.length > 0) {
     await ensureLiveModelsDiscoveredFromPool(fbToken);
@@ -1356,25 +1456,48 @@ const handleChatCompletions = async (req: Request, res: Response) => {
   const now = Date.now();
   const dirtyProviderKeys = new Set<StoredProviderKey>();
 
-  // Recover expired 429 cooldowns and build healthy active key pool
-  const availableKeys = masterProviderKeys.filter((k) => {
-    if (k.status === 'disabled' || k.status === 'exhausted') return false;
-    if (k.status === 'rate_limited') {
-      if (k.cooldownUntil && k.cooldownUntil > now) return false;
-      k.status = 'active';
-      k.cooldownUntil = undefined;
-      k.updatedAt = new Date().toISOString();
-      dirtyProviderKeys.add(k);
-    }
-    if (isMaskedOrInvalidHeaderKey(k.key)) return false;
-    return true;
-  });
+  const buildAvailableKeys = () =>
+    masterProviderKeys.filter((k) => {
+      if (k.status === 'disabled' || k.status === 'exhausted') return false;
+      if (k.status === 'rate_limited') {
+        if (k.cooldownUntil && k.cooldownUntil > now) return false;
+        k.status = 'active';
+        k.cooldownUntil = undefined;
+        k.updatedAt = new Date().toISOString();
+        dirtyProviderKeys.add(k);
+      }
+      if (isMaskedOrInvalidHeaderKey(k.key)) return false;
+      return true;
+    });
+
+  let availableKeys = buildAvailableKeys();
 
   const requestedModelRaw = typeof model === 'string' && model.trim() ? model.trim() : 'auto';
+  const isAutoModelRequest =
+    requestedModelRaw.toLowerCase() === 'auto' || requestedModelRaw.toLowerCase() === 'default';
 
   const findKeysForModel = (targetModelId: string, targetRecord?: StoredModel, keyPool = availableKeys) => {
+    const keys: StoredProviderKey[] = [];
+
+    // Support direct model-level upstream credentials if configured on the model record
+    if (targetRecord?.upstreamApiKey && !isMaskedOrInvalidHeaderKey(targetRecord.upstreamApiKey)) {
+      keys.push({
+        id: targetRecord.ownerKeyId || `model_key_${toRtdbKey(targetRecord.id)}`,
+        provider: (targetRecord.provider || 'custom') as SupportedProvider,
+        key: targetRecord.upstreamApiKey,
+        keyHint: targetRecord.ownerKeyHint || 'model-key',
+        customBaseUrl: targetRecord.customBaseUrl,
+        status: 'active',
+        supportedModels: [targetModelId],
+        requestCount: 0,
+        errorCount: 0,
+        createdAt: targetRecord.discoveredAt || new Date().toISOString(),
+        updatedAt: targetRecord.updatedAt || new Date().toISOString()
+      });
+    }
+
     const targetProvider = targetRecord?.provider;
-    const keys = keyPool.filter((k) => {
+    const poolMatches = keyPool.filter((k) => {
       const ownsModel =
         (Array.isArray(k.supportedModels) && k.supportedModels.includes(targetModelId)) ||
         (targetRecord?.ownerKeyId && k.id === targetRecord.ownerKeyId);
@@ -1383,8 +1506,8 @@ const handleChatCompletions = async (req: Request, res: Response) => {
     });
 
     // Load-balanced sorting: model owner -> fewest errors -> round-robin + least recently used
-    const cursor = roundRobinCursor++ % Math.max(1, keys.length);
-    keys.sort((a, b) => {
+    const cursor = roundRobinCursor++ % Math.max(1, poolMatches.length);
+    poolMatches.sort((a, b) => {
       const aOwns = a.supportedModels?.includes(targetModelId) || a.id === targetRecord?.ownerKeyId ? 1 : 0;
       const bOwns = b.supportedModels?.includes(targetModelId) || b.id === targetRecord?.ownerKeyId ? 1 : 0;
       if (aOwns !== bOwns) return bOwns - aOwns;
@@ -1399,10 +1522,14 @@ const handleChatCompletions = async (req: Request, res: Response) => {
       return (a.requestCount || 0) - (b.requestCount || 0);
     });
 
-    // Apply round-robin rotation across tied lowest-error keys so traffic distributes evenly
-    if (keys.length > 1 && cursor > 0 && (keys[0].errorCount || 0) === (keys[cursor].errorCount || 0)) {
-      const rotated = [...keys.slice(cursor), ...keys.slice(0, cursor)];
-      return rotated;
+    if (
+      poolMatches.length > 1 &&
+      cursor > 0 &&
+      (poolMatches[0].errorCount || 0) === (poolMatches[cursor].errorCount || 0)
+    ) {
+      keys.push(...poolMatches.slice(cursor), ...poolMatches.slice(0, cursor));
+    } else {
+      keys.push(...poolMatches);
     }
     return keys;
   };
@@ -1452,68 +1579,84 @@ const handleChatCompletions = async (req: Request, res: Response) => {
       const match = routableEntries.find((entry) => entry.id.toLowerCase() === preferredId);
       if (match) return match;
     }
+
+    const freeNonTilde = routableEntries.find(
+      (entry) => !entry.id.startsWith('~') && entry.id.includes(':free') && !NON_CHAT_MODEL_RE.test(entry.id)
+    );
+    if (freeNonTilde) return freeNonTilde;
+
+    const standardChat = routableEntries.find(
+      (entry) => !entry.id.startsWith('~') && !NON_CHAT_MODEL_RE.test(entry.id)
+    );
+    if (standardChat) return standardChat;
+
     return routableEntries.find((entry) => !NON_CHAT_MODEL_RE.test(entry.id)) || routableEntries[0];
   };
 
-  // Resolve requested model (handle 'auto'/'default', exact match, case-insensitive, or fallback)
+  const findModelInCatalog = (targetId: string): { id: string; record: StoredModel } | undefined => {
+    const exact = masterModels.get(targetId);
+    if (exact) return { id: exact.id, record: exact };
+
+    const lower = targetId.toLowerCase();
+    for (const [id, rec] of masterModels.entries()) {
+      if (id.toLowerCase() === lower) return { id, record: rec };
+    }
+
+    for (const pk of masterProviderKeys) {
+      if (pk.status === 'disabled' || !Array.isArray(pk.supportedModels)) continue;
+      const pkMatch = pk.supportedModels.find((mId) => mId.toLowerCase() === lower);
+      if (pkMatch) {
+        return {
+          id: pkMatch,
+          record: {
+            id: pkMatch,
+            name: formatModelDisplayName(pkMatch),
+            provider: pk.provider,
+            ownerKeyId: pk.id,
+            ownerKeyHint: pk.keyHint,
+            discoveredAt: pk.updatedAt || pk.createdAt || new Date().toISOString()
+          }
+        };
+      }
+    }
+    return undefined;
+  };
+
+  // Resolve requested model directly against Firebase RTDB `models`
   let effectiveModel = requestedModelRaw;
   let usedFallbackModel = false;
   let modelRecord: StoredModel | undefined;
 
-  if (requestedModelRaw.toLowerCase() !== 'auto' && requestedModelRaw.toLowerCase() !== 'default') {
-    modelRecord = masterModels.get(effectiveModel);
-    if (!modelRecord) {
-      const lowerReq = effectiveModel.toLowerCase();
-      for (const [id, rec] of masterModels.entries()) {
-        if (id.toLowerCase() === lowerReq) {
-          effectiveModel = id;
-          modelRecord = rec;
-          break;
-        }
-      }
+  if (!isAutoModelRequest) {
+    let found = findModelInCatalog(requestedModelRaw);
+    if (!found) {
+      // Force live RTDB refresh before returning 404 in case model was just added in Admin/Dashboard
+      await ensureGatewayHydrated(fbToken, true);
+      availableKeys = buildAvailableKeys();
+      found = findModelInCatalog(requestedModelRaw);
     }
 
-    // If requested model wasn't in warm cache (e.g. just added in Admin Panel), force live RTDB refresh immediately
-    if (!modelRecord) {
-      await ensureGatewayHydrated(fbToken, true);
-      availableKeys.length = 0;
-      for (const k of masterProviderKeys) {
-        if (k.status === 'disabled' || k.status === 'exhausted') continue;
-        if (k.status === 'rate_limited') {
-          if (k.cooldownUntil && k.cooldownUntil > now) continue;
-          k.status = 'active';
-          k.cooldownUntil = undefined;
-          k.updatedAt = new Date().toISOString();
-          dirtyProviderKeys.add(k);
+    if (!found) {
+      res.status(404).json({
+        error: {
+          message: `Model "${requestedModelRaw}" was not found in Firebase active models.`,
+          type: 'invalid_request_error',
+          code: 'model_not_found',
+          requested_model: requestedModelRaw
         }
-        if (!isMaskedOrInvalidHeaderKey(k.key)) availableKeys.push(k);
-      }
-      modelRecord = masterModels.get(effectiveModel);
-      if (!modelRecord) {
-        const lowerReq = effectiveModel.toLowerCase();
-        for (const [id, rec] of masterModels.entries()) {
-          if (id.toLowerCase() === lowerReq) {
-            effectiveModel = id;
-            modelRecord = rec;
-            break;
-          }
-        }
-      }
+      });
+      return;
     }
+
+    effectiveModel = found.id;
+    modelRecord = found.record;
   }
 
-  let candidateKeys =
-    requestedModelRaw.toLowerCase() === 'auto' || requestedModelRaw.toLowerCase() === 'default'
-      ? []
-      : findKeysForModel(effectiveModel, modelRecord);
+  let candidateKeys = isAutoModelRequest ? [] : findKeysForModel(effectiveModel, modelRecord);
 
-  // If requested model isn't matched or caller passed 'auto', pick best chat-capable active model
-  if (candidateKeys.length === 0 && availableKeys.length > 0) {
+  if (isAutoModelRequest && availableKeys.length > 0) {
     const picked = pickChatModelForPool(availableKeys);
     if (picked) {
-      if (requestedModelRaw.toLowerCase() !== 'auto' && requestedModelRaw.toLowerCase() !== 'default') {
-        usedFallbackModel = true;
-      }
       effectiveModel = picked.id;
       modelRecord = picked.record;
       candidateKeys = findKeysForModel(effectiveModel, modelRecord);
@@ -1536,6 +1679,9 @@ const handleChatCompletions = async (req: Request, res: Response) => {
   const triedModels = new Set<string>();
 
   const buildUpstreamPayload = (providerKey: StoredProviderKey, modelToUse: string, omitOptionalParams = false) => {
+    const upstreamModelName = modelRecord?.upstreamModel && modelToUse === effectiveModel
+      ? modelRecord.upstreamModel
+      : modelToUse;
     const isAnthropic = providerKey.provider === 'anthropic';
     if (isAnthropic) {
       const sysMsgs = messages
@@ -1549,7 +1695,7 @@ const handleChatCompletions = async (req: Request, res: Response) => {
           content: m.content
         }));
       const payload: any = {
-        model: modelToUse,
+        model: upstreamModelName,
         messages: nonSysMsgs.length > 0 ? nonSysMsgs : [{ role: 'user', content: sysMsgs || 'Hello' }],
         max_tokens: max_completion_tokens ?? max_tokens ?? 2048,
         stream: Boolean(stream)
@@ -1559,9 +1705,9 @@ const handleChatCompletions = async (req: Request, res: Response) => {
       return payload;
     }
 
-    const isReasoningOrGpt5 = providerKey.provider === 'openai' && REASONING_OR_GPT5_RE.test(modelToUse);
+    const isReasoningOrGpt5 = providerKey.provider === 'openai' && REASONING_OR_GPT5_RE.test(upstreamModelName);
     const payload: any = {
-      model: modelToUse,
+      model: upstreamModelName,
       messages,
       stream: Boolean(stream)
     };
@@ -1596,11 +1742,12 @@ const handleChatCompletions = async (req: Request, res: Response) => {
 
   const executeUpstreamAttempt = async (providerKey: StoredProviderKey, modelToUse: string): Promise<boolean> => {
     const pairId = `${providerKey.id}::${modelToUse}`;
-    if (triedPairs.has(pairId)) return false;
+    if (triedPairs.has(pairId) || clientAborted) return false;
     triedPairs.add(pairId);
     triedModels.add(modelToUse);
 
-    const baseUrl = resolveProviderBaseUrl(providerKey.provider, providerKey.customBaseUrl);
+    const customUrlForModel = modelToUse === effectiveModel ? modelRecord?.customBaseUrl : undefined;
+    const baseUrl = resolveProviderBaseUrl(providerKey.provider, customUrlForModel || providerKey.customBaseUrl);
     const isAnthropic = providerKey.provider === 'anthropic';
     const chatPath = isAnthropic ? '/messages' : PROVIDER_CONFIGS[providerKey.provider]?.chatPath || '/chat/completions';
     const endpoint = `${baseUrl}${chatPath}`;
@@ -1724,59 +1871,71 @@ const handleChatCompletions = async (req: Request, res: Response) => {
         let sseBuffer = '';
         let streamedChars = 0;
 
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          const chunk = decoder.decode(value, { stream: true });
+        try {
+          while (!clientAborted) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const chunk = decoder.decode(value, { stream: true });
 
-          if (isAnthropic) {
-            sseBuffer += chunk;
-            const lines = sseBuffer.split('\n');
-            sseBuffer = lines.pop() || '';
-            for (const line of lines) {
-              const converted = convertAnthropicSseLineToOpenAi(line, streamId, modelToUse);
-              if (converted.inputTokens) promptTokens = converted.inputTokens;
-              if (converted.outputTokens) completionTokens = converted.outputTokens;
-              if (converted.deltaChars) streamedChars += converted.deltaChars;
-              if (converted.sseChunk) res.write(converted.sseChunk);
-            }
-          } else {
-            res.write(chunk);
-            streamedChars += chunk.length;
-            // Sniff usage frame if provider emits stream_options usage
-            for (const line of chunk.split('\n')) {
-              const trimmed = line.trim();
-              if (!trimmed.startsWith('data:') || trimmed === 'data: [DONE]') continue;
-              try {
-                const parsed = JSON.parse(trimmed.slice(5).trim());
-                if (parsed?.usage) {
-                  if (typeof parsed.usage.prompt_tokens === 'number') promptTokens = parsed.usage.prompt_tokens;
-                  if (typeof parsed.usage.completion_tokens === 'number') {
-                    completionTokens = parsed.usage.completion_tokens;
+            if (isAnthropic) {
+              sseBuffer += chunk;
+              const lines = sseBuffer.split('\n');
+              sseBuffer = lines.pop() || '';
+              for (const line of lines) {
+                const converted = convertAnthropicSseLineToOpenAi(line, streamId, modelToUse);
+                if (converted.inputTokens) promptTokens = converted.inputTokens;
+                if (converted.outputTokens) completionTokens = converted.outputTokens;
+                if (converted.deltaChars) streamedChars += converted.deltaChars;
+                if (converted.sseChunk && !res.writableEnded) res.write(converted.sseChunk);
+              }
+            } else {
+              if (!res.writableEnded) res.write(chunk);
+              streamedChars += chunk.length;
+              // Sniff usage frame if provider emits stream_options usage
+              for (const line of chunk.split('\n')) {
+                const trimmed = line.trim();
+                if (!trimmed.startsWith('data:') || trimmed === 'data: [DONE]') continue;
+                try {
+                  const parsed = JSON.parse(trimmed.slice(5).trim());
+                  if (parsed?.usage) {
+                    if (typeof parsed.usage.prompt_tokens === 'number') promptTokens = parsed.usage.prompt_tokens;
+                    if (typeof parsed.usage.completion_tokens === 'number') {
+                      completionTokens = parsed.usage.completion_tokens;
+                    }
+                    if (typeof parsed.usage.total_tokens === 'number') totalTokensOverride = parsed.usage.total_tokens;
                   }
-                  if (typeof parsed.usage.total_tokens === 'number') totalTokensOverride = parsed.usage.total_tokens;
+                } catch {
+                  // Ignore partial SSE JSON lines split across chunks
                 }
-              } catch {
-                // Ignore partial SSE JSON lines split across chunks
               }
             }
           }
-        }
 
-        const remaining = decoder.decode();
-        if (remaining) {
-          if (isAnthropic) {
-            for (const line of (sseBuffer + remaining).split('\n')) {
-              const converted = convertAnthropicSseLineToOpenAi(line, streamId, modelToUse);
-              if (converted.sseChunk) res.write(converted.sseChunk);
+          if (!clientAborted && !res.writableEnded) {
+            const remaining = decoder.decode();
+            if (remaining) {
+              if (isAnthropic) {
+                for (const line of (sseBuffer + remaining).split('\n')) {
+                  const converted = convertAnthropicSseLineToOpenAi(line, streamId, modelToUse);
+                  if (converted.sseChunk) res.write(converted.sseChunk);
+                }
+                res.write('data: [DONE]\n\n');
+              } else {
+                res.write(remaining);
+                streamedChars += remaining.length;
+              }
+            } else if (isAnthropic) {
+              res.write('data: [DONE]\n\n');
             }
-            res.write('data: [DONE]\n\n');
-          } else {
-            res.write(remaining);
-            streamedChars += remaining.length;
           }
-        } else if (isAnthropic) {
-          res.write('data: [DONE]\n\n');
+        } catch (streamErr: any) {
+          if (!res.writableEnded) {
+            res.write(
+              `data: ${JSON.stringify({
+                error: { message: streamErr?.message || 'Upstream stream interrupted', code: 'stream_interrupted' }
+              })}\n\ndata: [DONE]\n\n`
+            );
+          }
         }
 
         if (completionTokens === 0) {
@@ -2011,7 +2170,8 @@ const handleChatCompletions = async (req: Request, res: Response) => {
     dbOps.push(upsertItemInRtdb('request_logs', logEntry.id, logEntry, fbToken).catch(() => false));
   }
 
-  if (dbOps.length > 0) {
+  if (dbOps.length > 0 || success || dirtyProviderKeys.size > 0) {
+    dbOps.push(persistGatewaySnapshot().catch(() => false));
     await Promise.race([
       Promise.allSettled(dbOps),
       new Promise<void>((resolve) => setTimeout(resolve, 2500))
@@ -2019,25 +2179,33 @@ const handleChatCompletions = async (req: Request, res: Response) => {
   }
 
   if (!success) {
-    const statusToSend = candidateKeys.length === 0 && availableKeys.length === 0
-      ? 503
-      : candidateKeys.length === 0 && failoverCount === 0
-      ? 404
-      : lastErrorStatus >= 400
-      ? lastErrorStatus
-      : 502;
+    const rtdbPkDiag = lastRtdbDiagnostics.provider_keys;
+    const missingProviderKeysDueToRtdbRules =
+      availableKeys.length === 0 &&
+      candidateKeys.length === 0 &&
+      rtdbPkDiag &&
+      !rtdbPkDiag.ok &&
+      rtdbPkDiag.status === 401;
 
-    const errorMessage =
-      availableKeys.length === 0
-        ? `No active Admin Pool provider keys are currently healthy to serve "${requestedModelRaw}". Add or reset provider keys in the Admin Panel (/admin).`
-        : `Upstream request for "${effectiveModel}" failed after rotating across ${failoverCount} key/model attempt(s): ${lastErrorMsg.slice(0, 260)}`;
+    const statusToSend =
+      lastErrorStatus === 429
+        ? 429
+        : candidateKeys.length === 0 && availableKeys.length === 0
+        ? 502
+        : 502;
+
+    const errorMessage = missingProviderKeysDueToRtdbRules
+      ? `Firebase RTDB returned HTTP 401 Permission denied for /provider_keys.json and no active provider keys are cached on the server to serve "${effectiveModel}". Open Admin Dashboard once to sync provider keys or allow server read access on RTDB.`
+      : availableKeys.length === 0 && candidateKeys.length === 0
+      ? `No active upstream provider keys are available to serve "${effectiveModel}". Add or enable a provider key in Admin Pool.`
+      : `Upstream request for "${effectiveModel}" failed after ${Math.max(1, failoverCount)} attempt(s): ${lastErrorMsg.slice(0, 260) || 'Bad gateway'}`;
 
     if (!res.headersSent) {
       res.status(statusToSend).json({
         error: {
           message: errorMessage,
-          type: statusToSend === 429 ? 'rate_limit_error' : statusToSend === 404 ? 'model_not_found' : 'gateway_upstream_error',
-          code: statusToSend === 429 ? 'upstream_rate_limited' : statusToSend === 404 ? 'model_not_found' : 'upstream_failed',
+          type: statusToSend === 429 ? 'rate_limit_error' : 'gateway_upstream_error',
+          code: statusToSend === 429 ? 'upstream_rate_limited' : 'upstream_failed',
           requested_model: requestedModelRaw,
           routed_model: effectiveModel,
           failover_count: failoverCount
@@ -2178,7 +2346,10 @@ gatewayApp.post('/api/keys', async (req: Request, res: Response) => {
 
     masterApiKeys.set(newKey.key, newKey);
 
-    const persistedToDb = await upsertItemInRtdb('api_keys', newKey.id, newKey, fbToken);
+    const [persistedToDb] = await Promise.all([
+      upsertItemInRtdb('api_keys', newKey.id, newKey, fbToken),
+      persistGatewaySnapshot()
+    ]);
 
     res.status(200).json({
       success: true,
@@ -2202,7 +2373,10 @@ gatewayApp.delete('/api/keys/:id', async (req: Request, res: Response) => {
     }
   }
 
-  await deleteItemFromRtdb('api_keys', id, fbToken);
+  await Promise.all([
+    deleteItemFromRtdb('api_keys', id, fbToken),
+    persistGatewaySnapshot()
+  ]);
 
   res.json({ success: true, removed });
 });
@@ -2333,11 +2507,12 @@ const handleBulkAddKeys = async (req: Request, res: Response) => {
       }
       const [keysOk] = await Promise.all([
         patchCollectionInRtdb('provider_keys', keysPatch, fbToken),
-        syncModelsInRtdb(syncedModelsList, fbToken)
+        syncModelsInRtdb(syncedModelsList, fbToken),
+        persistGatewaySnapshot()
       ]);
       rtdbPersistedCount = keysOk ? addedKeys.length : 0;
     } catch {
-      // Non-fatal fallback; frontend also persists to RTDB
+      await persistGatewaySnapshot().catch(() => {});
     }
 
     res.status(200).json({
@@ -2398,7 +2573,10 @@ gatewayApp.post('/api/admin/keys/reset-cooldowns', checkOptionalAdminHeader, asy
   rebuildMasterModelsFromPool();
 
   if (restoredCount > 0) {
-    await patchCollectionInRtdb('provider_keys', restoredPatch, fbToken).catch(() => {});
+    await Promise.all([
+      patchCollectionInRtdb('provider_keys', restoredPatch, fbToken),
+      persistGatewaySnapshot()
+    ]).catch(() => {});
   }
 
   res.json({
@@ -2428,7 +2606,8 @@ gatewayApp.patch('/api/admin/keys/:id/status', checkOptionalAdminHeader, async (
   const modelsList = Array.from(masterModels.values());
   await Promise.all([
     upsertItemInRtdb('provider_keys', target.id, target, fbToken),
-    syncModelsInRtdb(modelsList, fbToken)
+    syncModelsInRtdb(modelsList, fbToken),
+    persistGatewaySnapshot()
   ]).catch(() => {});
 
   res.json({ success: true, key: target, models: modelsList });
@@ -2448,7 +2627,8 @@ gatewayApp.delete('/api/admin/keys/:id', checkOptionalAdminHeader, async (req: R
   const modelsList = Array.from(masterModels.values());
   await Promise.all([
     deleteItemFromRtdb('provider_keys', id, fbToken),
-    syncModelsInRtdb(modelsList, fbToken)
+    syncModelsInRtdb(modelsList, fbToken),
+    persistGatewaySnapshot()
   ]).catch(() => {});
 
   res.json({ success: true, models: modelsList, totalKeysInPool: masterProviderKeys.length });
@@ -2489,7 +2669,8 @@ gatewayApp.post('/api/models/refresh', async (req: Request, res: Response) => {
   const modelsList = Array.from(masterModels.values());
   await Promise.all([
     patchCollectionInRtdb('provider_keys', updatedPatch, fbToken),
-    syncModelsInRtdb(modelsList, fbToken)
+    syncModelsInRtdb(modelsList, fbToken),
+    persistGatewaySnapshot()
   ]).catch(() => {});
 
   res.json({
@@ -2544,7 +2725,8 @@ gatewayApp.post('/api/admin/test-key', checkOptionalAdminHeader, async (req: Req
   }
 });
 
-gatewayApp.post('/api/gateway/sync', (req: Request, res: Response) => {
+gatewayApp.post('/api/gateway/sync', async (req: Request, res: Response) => {
+  hydrateFromLocalSnapshotIfNeeded();
   const { apiKeys, providerKeys, models, replaceProviderKeys } = req.body || {};
 
   if (Array.isArray(apiKeys)) {
@@ -2571,27 +2753,31 @@ gatewayApp.post('/api/gateway/sync', (req: Request, res: Response) => {
     rebuildMasterModelsFromPool();
   }
 
-  // Hydrate active models from RTDB sync payload
-  if (Array.isArray(models) && masterProviderKeys.length === 0) {
-    masterModels.clear();
-    if (!replaceProviderKeys) {
-      for (const m of models) {
-        if (m && m.id && m.isActive !== false) {
-          masterModels.set(m.id, {
-            id: m.id,
-            name: m.name || formatModelDisplayName(m.id),
-            provider: m.provider || 'custom',
-            ownerKeyId: m.ownerKeyId,
-            ownerKeyHint: m.ownerKeyHint,
-            discoveredAt: m.discoveredAt || new Date().toISOString(),
-            contextWindow: m.contextWindow,
-            description: m.description
-          });
-        }
+  // Merge active models from RTDB sync payload
+  if (Array.isArray(models) && models.length > 0) {
+    if (masterProviderKeys.length === 0 && !replaceProviderKeys) {
+      masterModels.clear();
+    }
+    for (const m of models) {
+      if (m && m.id && m.isActive !== false && !masterModels.has(m.id)) {
+        masterModels.set(m.id, {
+          id: m.id,
+          name: m.name || formatModelDisplayName(m.id),
+          provider: m.provider || 'custom',
+          ownerKeyId: m.ownerKeyId,
+          ownerKeyHint: m.ownerKeyHint,
+          upstreamModel: m.upstreamModel,
+          customBaseUrl: m.customBaseUrl,
+          upstreamApiKey: m.upstreamApiKey,
+          discoveredAt: m.discoveredAt || new Date().toISOString(),
+          contextWindow: m.contextWindow,
+          description: m.description
+        });
       }
     }
   }
 
+  await persistGatewaySnapshot();
 
   res.json({
     success: true,
@@ -2623,6 +2809,7 @@ gatewayApp.get('/api/stats', async (req: Request, res: Response) => {
     totalProviderKeys: masterProviderKeys.length,
     totalModels: masterModels.size,
     rtdbBridge: getRtdbBridgeStatus(),
+    rtdbDiagnostics: lastRtdbDiagnostics,
     logs: masterLogs.slice(0, 50)
   });
 });
